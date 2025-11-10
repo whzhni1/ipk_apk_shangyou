@@ -93,11 +93,11 @@ jobs:
             
             git commit -m "🔄 同步工具脚本更新
 
-变更文件:$CHANGED_FILES
+            变更文件:$CHANGED_FILES
 
-- 来源: ${{ github.repository }}
-- 提交: ${{ github.sha }}
-- 时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
+            - 来源: ${{ github.repository }}
+            - 提交: ${{ github.sha }}
+            - 时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
             
             echo "🚀 推送到 ${{ env.SOURCE_REPO }}..."
             git push
