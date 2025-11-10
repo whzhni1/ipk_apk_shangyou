@@ -6,10 +6,8 @@ SCRIPT_VERSION="1.0.0"
 CACHE_FILE="/tmp/third-party-repo.cache"
 CACHE_TTL=3600
 
-# 需要初始化为空的变量列表
-EMPTY_VARS="SYS_ARCH PKG_EXT PKG_INSTALL ARCH_FALLBACK API_SOURCES GITEE_TOKEN GITCODE_TOKEN"
-
 # 批量初始化变量
+EMPTY_VARS="SYS_ARCH PKG_EXT PKG_INSTALL ARCH_FALLBACK API_SOURCES GITEE_TOKEN GITCODE_TOKEN"
 for var in $EMPTY_VARS; do
     eval "$var=''"
 done
@@ -25,7 +23,6 @@ load_config() {
     
     if [ ! -f "$conf" ]; then
         log "配置文件不存在: $conf"
-        log "请先运行 auto-setup 进行初始化"
         return 1
     fi
     
@@ -44,19 +41,268 @@ load_config() {
     return 0
 }
 
-# 功能: 加载公共函数库
-load_common_lib() {
-    local lib="/usr/lib/auto-tools-common.sh"
-    if [ ! -f "$lib" ]; then
-        log "公共函数库不存在: $lib"
+# 功能: 格式化文件大小
+format_size() {
+    local bytes="$1"
+    if [ "$bytes" -gt 1048576 ]; then
+        echo "$((bytes / 1048576)) MB"
+    elif [ "$bytes" -gt 1024 ]; then
+        echo "$((bytes / 1024)) KB"
+    else
+        echo "$bytes B"
+    fi
+}
+
+# 功能: 验证下载的文件
+validate_downloaded_file() {
+    local filepath="$1"
+    local min_size="${2:-1024}"
+    
+    if [ ! -f "$filepath" ] || [ ! -s "$filepath" ]; then
+        log "  文件无效: 不存在或为空"
         return 1
     fi
     
-    . "$lib"
+    local size=$(wc -c < "$filepath" 2>/dev/null | tr -d ' ' || echo "0")
+    
+    if [ "$size" -lt "$min_size" ]; then
+        if head -1 "$filepath" 2>/dev/null | grep -qi "<!DOCTYPE\|<html"; then
+            log "  文件无效: 下载的是HTML页面"
+            return 1
+        fi
+    fi
+    
+    log "  文件有效: $(format_size $size)"
     return 0
 }
 
-# 功能: 获取仓库元数据（带缓存）
+# 功能: 获取平台Token
+get_token_for_platform() {
+    local platform="$1"
+    case "$platform" in
+        gitee) echo "$GITEE_TOKEN" ;;
+        gitcode) echo "$GITCODE_TOKEN" ;;
+        *) echo "" ;;
+    esac
+}
+
+# 功能: API调用
+api_get_contents() {
+    local platform="$1"
+    local repo="$2"
+    local path="$3"
+    local branch="$4"
+    
+    local token=$(get_token_for_platform "$platform")
+    local api_url=""
+    
+    case "$platform" in
+        gitee)
+            api_url="https://gitee.com/api/v5/repos/${repo}/contents/${path}?ref=${branch}"
+            ;;
+        gitcode)
+            api_url="https://api.gitcode.com/api/v5/repos/${repo}/contents/${path}?ref=${branch}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    
+    if [ -n "$token" ]; then
+        curl -s -H "User-Agent: Mozilla/5.0" -H "Authorization: Bearer $token" "$api_url"
+    else
+        curl -s -H "User-Agent: Mozilla/5.0" "$api_url"
+    fi
+}
+
+# 功能: 从JSON提取目录
+extract_dirs_from_json() {
+    local json="$1"
+    if which jsonfilter >/dev/null 2>&1; then
+        echo "$json" | jsonfilter -e '@[@.type="dir"].name' 2>/dev/null
+    else
+        echo "$json" | grep -o '"type":"dir"[^}]*}' | \
+            grep -o '"name":"[^"]*"' | cut -d'"' -f4
+    fi
+}
+
+# 功能: 从JSON提取文件
+extract_files_from_json() {
+    local json="$1"
+    local ext="$2"
+    if which jsonfilter >/dev/null 2>&1; then
+        echo "$json" | jsonfilter -e '@[@.type="file"].name' 2>/dev/null | grep "${ext}$"
+    else
+        echo "$json" | grep -o '"type":"file"[^}]*}' | \
+            grep -o "\"name\":\"[^\"]*${ext}\"" | cut -d'"' -f4
+    fi
+}
+
+# 功能: 从JSON提取下载URL
+extract_download_url_from_json() {
+    local json="$1"
+    local filename="$2"
+    
+    local download_url=""
+    
+    if which jsonfilter >/dev/null 2>&1; then
+        download_url=$(echo "$json" | jsonfilter -e "@[@.name=\"$filename\"].download_url" 2>/dev/null | head -1)
+    else
+        download_url=$(echo "$json" | \
+            grep -o "\"name\":\"$filename\"[^}]*\"download_url\":\"[^\"]*\"" | \
+            grep -o '"download_url":"[^"]*"' | cut -d'"' -f4 | head -1)
+        
+        if [ -z "$download_url" ]; then
+            download_url=$(echo "$json" | \
+                grep -o "\"download_url\":\"[^\"]*\"[^}]*\"name\":\"$filename\"" | \
+                grep -o '"download_url":"[^"]*"' | cut -d'"' -f4 | head -1)
+        fi
+        
+        if [ -z "$download_url" ]; then
+            download_url=$(echo "$json" | grep -o "https://[^\"]*$filename" | head -1)
+        fi
+    fi
+    
+    if [ -z "$download_url" ]; then
+        return 1
+    fi
+    
+    echo "$download_url"
+    return 0
+}
+
+# 功能: 版本号标准化
+normalize_version() {
+    echo "$1" | sed 's/^[vV]//' | sed 's/-r\?[0-9]*$//'
+}
+
+# 功能: 生成架构变体
+generate_arch_variants() {
+    local arch="$1"
+    local variants="$arch"
+    
+    local dash_ver=$(echo "$arch" | tr '_' '-')
+    [ "$dash_ver" != "$arch" ] && variants="$variants $dash_ver"
+    
+    local under_ver=$(echo "$arch" | tr '-' '_')
+    [ "$under_ver" != "$arch" ] && variants="$variants $under_ver"
+    
+    local nosep=$(echo "$arch" | tr -d '_-')
+    [ "$nosep" != "$arch" ] && variants="$variants $nosep"
+    
+    case "$arch" in
+        aarch64*|arm64*)
+            variants="$variants arm64 aarch64" ;;
+        armv7*|armhf*)
+            variants="$variants armv7 armhf arm" ;;
+        x86_64*|amd64*)
+            variants="$variants x86_64 amd64 x86-64" ;;
+    esac
+    
+    echo "$variants" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' '
+}
+
+# 功能: 计算文件相似度
+calculate_file_similarity() {
+    local filename="$1"
+    local package_name="$2"
+    local target_arch="$3"
+    local file_size="${4:-0}"
+    
+    local similarity=0
+    
+    if echo "$filename" | grep -qiE "^${package_name}[_-]"; then
+        similarity=$((similarity + 100))
+    elif echo "$filename" | grep -qi "$package_name"; then
+        similarity=$((similarity + 50))
+    else
+        return 0
+    fi
+    
+    local arch_matched=0
+    for variant in $(generate_arch_variants "$target_arch"); do
+        if echo "$filename" | grep -qi "[_-]${variant}[_\.-]"; then
+            similarity=$((similarity + 200))
+            arch_matched=1
+            break
+        fi
+    done
+    
+    if [ $arch_matched -eq 0 ]; then
+        for exc in x86_64 amd64 i386 armv7 armhf mipsel mips64 riscv; do
+            if echo "$filename" | grep -qiE "[_-]${exc}[_\.-]"; then
+                similarity=$((similarity - 500))
+                break
+            fi
+        done
+    fi
+    
+    if [ "$file_size" -gt 15728640 ]; then
+        similarity=$((similarity + 100))
+    elif [ "$file_size" -gt 5242880 ]; then
+        similarity=$((similarity + 80))
+    fi
+    
+    echo "$filename" | grep -qiE "[_-](all|noarch)[_\.]" && \
+        similarity=$((similarity + 60))
+    
+    echo "$filename" | grep -qi "i18n.*zh-cn" && \
+        similarity=$((similarity + 30))
+    
+    echo $similarity
+}
+
+# 功能: 查找最佳匹配
+find_best_match() {
+    local all_files="$1"
+    local package_name="$2"
+    
+    local best_file=""
+    local best_similarity=0
+    local best_arch=""
+    local arch_priority_bonus=1000
+    
+    for arch in $ARCH_FALLBACK; do
+        local old_IFS="$IFS"
+        IFS=$'\n'
+        
+        for filename in $all_files; do
+            [ -z "$filename" ] && continue
+            
+            local base_similarity=$(calculate_file_similarity "$filename" "$package_name" "$arch" "0")
+            local total_similarity=$((base_similarity + arch_priority_bonus))
+            
+            if [ $total_similarity -gt $best_similarity ]; then
+                best_similarity=$total_similarity
+                best_file="$filename"
+                best_arch="$arch"
+            fi
+        done
+        
+        IFS="$old_IFS"
+        arch_priority_bonus=$((arch_priority_bonus - 100))
+    done
+    
+    if [ $best_similarity -ge 150 ]; then
+        log "    匹配成功: $best_file (架构: $best_arch, 相似度: $best_similarity)"
+        echo "$best_file"
+        return 0
+    fi
+    
+    log "    匹配失败: 最高相似度 $best_similarity < 150"
+    return 1
+}
+
+# 功能: 检查包是否已安装
+is_installed() {
+    if echo "$PKG_INSTALL" | grep -q "opkg"; then
+        opkg list-installed | grep -q "^$1 "
+    else
+        apk info -e "$1" >/dev/null 2>&1
+    fi
+}
+
+# 功能: 获取仓库元数据
 get_repo_metadata() {
     local force_refresh="${1:-0}"
     
@@ -89,7 +335,6 @@ get_repo_metadata() {
             echo "" >> "$CACHE_FILE"
             echo "<!-- Cached: $(date '+%Y-%m-%d %H:%M:%S') -->" >> "$CACHE_FILE"
             echo "<!-- Platform: $platform -->" >> "$CACHE_FILE"
-            echo "<!-- Repository: $repo -->" >> "$CACHE_FILE"
             
             echo "$metadata"
             return 0
@@ -98,51 +343,6 @@ get_repo_metadata() {
     
     log "  所有源均失败"
     return 1
-}
-
-# 功能: 检查单个脚本的更新
-check_single_script() {
-    local metadata="$1"
-    local script_name="$2"
-    local local_path="$3"
-    
-    log "  检查 $script_name"
-    
-    local download_url=$(extract_download_url_from_json "$metadata" "$script_name")
-    [ -z "$download_url" ] && {
-        log "    未找到下载链接"
-        return 1
-    }
-    
-    log "    获取远程版本..."
-    local remote_ver=$(curl -fsSL "$download_url" 2>/dev/null | head -20 | \
-        grep -o 'SCRIPT_VERSION="[^"]*"' | head -1 | cut -d'"' -f2)
-    
-    local local_ver=$(grep -o 'SCRIPT_VERSION="[^"]*"' "$local_path" 2>/dev/null | head -1 | cut -d'"' -f2)
-    
-    log "    本地: ${local_ver:-未安装}, 远程: $remote_ver"
-    
-    [ "$local_ver" = "$remote_ver" ] && {
-        log "    无需更新"
-        return 1
-    }
-    
-    log "    下载新版本..."
-    local temp="/tmp/${script_name}.new"
-    
-    curl -fsSL -o "$temp" "$download_url" 2>/dev/null || {
-        log "    下载失败"
-        return 1
-    }
-    
-    validate_downloaded_file "$temp" 1024 || {
-        rm -f "$temp"
-        return 1
-    }
-    
-    mv "$temp" "$local_path" && chmod +x "$local_path"
-    log "    更新完成: $local_ver → $remote_ver"
-    return 0
 }
 
 # 功能: 检查脚本更新
@@ -155,12 +355,50 @@ check_scripts_update() {
     local updater_updated=0
     local installer_updated=0
     
-    if check_single_script "$metadata" "auto-update.sh" "/usr/bin/auto-update.sh"; then
-        updater_updated=1
+    # 检查 auto-update.sh
+    log "  检查 auto-update.sh"
+    local download_url=$(extract_download_url_from_json "$metadata" "auto-update.sh")
+    if [ -n "$download_url" ]; then
+        local remote_ver=$(curl -fsSL "$download_url" 2>/dev/null | head -20 | \
+            grep -o 'SCRIPT_VERSION="[^"]*"' | head -1 | cut -d'"' -f2)
+        local local_ver=$(grep -o 'SCRIPT_VERSION="[^"]*"' "/usr/bin/auto-update.sh" 2>/dev/null | head -1 | cut -d'"' -f2)
+        
+        log "    本地: ${local_ver:-未安装}, 远程: $remote_ver"
+        
+        if [ "$local_ver" != "$remote_ver" ] && [ -n "$remote_ver" ]; then
+            log "    下载新版本..."
+            if curl -fsSL -o "/tmp/auto-update.sh.new" "$download_url" 2>/dev/null; then
+                if validate_downloaded_file "/tmp/auto-update.sh.new" 1024; then
+                    mv "/tmp/auto-update.sh.new" "/usr/bin/auto-update.sh"
+                    chmod +x "/usr/bin/auto-update.sh"
+                    log "    更新完成: $local_ver → $remote_ver"
+                    updater_updated=1
+                fi
+            fi
+        fi
     fi
     
-    if check_single_script "$metadata" "third-party-installer.sh" "/usr/bin/third-party-installer.sh"; then
-        installer_updated=1
+    # 检查 third-party-installer.sh
+    log "  检查 third-party-installer.sh"
+    download_url=$(extract_download_url_from_json "$metadata" "third-party-installer.sh")
+    if [ -n "$download_url" ]; then
+        local remote_ver=$(curl -fsSL "$download_url" 2>/dev/null | head -20 | \
+            grep -o 'SCRIPT_VERSION="[^"]*"' | head -1 | cut -d'"' -f2)
+        local local_ver=$(grep -o 'SCRIPT_VERSION="[^"]*"' "$0" 2>/dev/null | head -1 | cut -d'"' -f2)
+        
+        log "    本地: ${local_ver:-未安装}, 远程: $remote_ver"
+        
+        if [ "$local_ver" != "$remote_ver" ] && [ -n "$remote_ver" ]; then
+            log "    下载新版本..."
+            if curl -fsSL -o "/tmp/third-party-installer.sh.new" "$download_url" 2>/dev/null; then
+                if validate_downloaded_file "/tmp/third-party-installer.sh.new" 1024; then
+                    mv "/tmp/third-party-installer.sh.new" "/usr/bin/third-party-installer.sh"
+                    chmod +x "/usr/bin/third-party-installer.sh"
+                    log "    更新完成: $local_ver → $remote_ver"
+                    installer_updated=1
+                fi
+            fi
+        fi
     fi
     
     [ $updater_updated -eq 1 ] && return 3
@@ -168,7 +406,7 @@ check_scripts_update() {
     return 0
 }
 
-# 功能: 智能筛选相关文件
+# 功能: 筛选相关文件
 filter_related_files() {
     local all_files="$1"
     local package_name="$2"
@@ -204,11 +442,10 @@ filter_related_files() {
     done
     
     IFS="$old_IFS"
-    
     echo -e "$matched_files" | grep -v "^$"
 }
 
-# 功能: 批量安装包文件
+# 功能: 批量安装
 install_package_batch() {
     local pkg_files="$1"
     
@@ -274,7 +511,6 @@ install_package_batch() {
             
             log "    安装: $pkg_name"
             
-            # 直接调用，输出自动进入父进程日志
             if $PKG_INSTALL "$pkg_file"; then
                 log "    成功"
                 total_ok=$((total_ok + 1))
@@ -292,7 +528,7 @@ install_package_batch() {
     [ $total_fail -eq 0 ] && return 0 || return 1
 }
 
-# 功能: 安装或更新第三方包
+# 功能: 安装或更新包
 install_third_party_package() {
     local package_name="$1"
     local mode="${2:-install}"
@@ -302,18 +538,9 @@ install_third_party_package() {
     [ "$mode" = "update" ] && log "  当前版本: $current_version"
     
     local metadata=$(get_repo_metadata)
+    [ -z "$metadata" ] && { log "  无法获取仓库信息"; return 1; }
     
-    if [ -z "$metadata" ]; then
-        log "  无法获取仓库信息"
-        return 1
-    fi
-    
-    local package_dirs=""
-    if which jsonfilter >/dev/null 2>&1; then
-        package_dirs=$(echo "$metadata" | jsonfilter -e '@[@.type="dir"].name' 2>/dev/null)
-    else
-        package_dirs=$(extract_dirs_from_json "$metadata")
-    fi
+    local package_dirs=$(extract_dirs_from_json "$metadata")
     
     if ! echo "$package_dirs" | grep -q "^${package_name}$"; then
         log "  仓库中不存在该包: $package_name"
@@ -330,24 +557,10 @@ install_third_party_package() {
         log "  [源] $platform"
         
         local versions_json=$(api_get_contents "$platform" "$repo" "$package_name" "$branch")
+        [ -z "$versions_json" ] && { log "    查询失败"; continue; }
         
-        if [ -z "$versions_json" ]; then
-            log "    查询失败"
-            continue
-        fi
-        
-        local versions=""
-        if which jsonfilter >/dev/null 2>&1; then
-            versions=$(echo "$versions_json" | jsonfilter -e '@[@.type="dir"].name' 2>/dev/null | \
-                grep -E '^(v?[0-9]+\.|v[0-9])' | sort -Vr)
-        else
-            versions=$(extract_dirs_from_json "$versions_json" | grep '^v' | sort -Vr)
-        fi
-        
-        if [ -z "$versions" ]; then
-            log "    未找到版本"
-            continue
-        fi
+        local versions=$(extract_dirs_from_json "$versions_json" | grep '^v' | sort -Vr)
+        [ -z "$versions" ] && { log "    未找到版本"; continue; }
         
         local latest_version=$(echo "$versions" | head -1)
         log "    最新版本: $latest_version"
@@ -363,38 +576,19 @@ install_third_party_package() {
         fi
         
         local files_json=$(api_get_contents "$platform" "$repo" "$package_name/$latest_version" "$branch")
+        [ -z "$files_json" ] && { log "    无法获取文件列表"; continue; }
         
-        if [ -z "$files_json" ]; then
-            log "    无法获取文件列表"
-            continue
-        fi
-        
-        local all_files=""
-        if which jsonfilter >/dev/null 2>&1; then
-            all_files=$(echo "$files_json" | jsonfilter -e '@[@.type="file"].name' 2>/dev/null | \
-                grep "${PKG_EXT}$")
-        else
-            all_files=$(extract_files_from_json "$files_json" "$PKG_EXT")
-        fi
-        
-        if [ -z "$all_files" ]; then
-            log "    未找到 ${PKG_EXT} 文件"
-            continue
-        fi
+        local all_files=$(extract_files_from_json "$files_json" "$PKG_EXT")
+        [ -z "$all_files" ] && { log "    未找到 ${PKG_EXT} 文件"; continue; }
         
         log "    可用文件 (共 $(echo "$all_files" | wc -l) 个):"
         echo "$all_files" | while read f; do log "      $f"; done
         
         log "    筛选相关文件:"
         local matched_files=$(filter_related_files "$all_files" "$package_name")
-        
-        if [ -z "$matched_files" ]; then
-            log "    未找到匹配文件"
-            continue
-        fi
+        [ -z "$matched_files" ] && { log "    未找到匹配文件"; continue; }
         
         log "    匹配结果 (共 $(echo "$matched_files" | wc -l) 个):"
-        echo "$matched_files" | while read f; do log "      $f"; done
         
         log "    开始下载..."
         local temp_dir="/tmp/third_party_${package_name}_$$"
@@ -410,15 +604,9 @@ install_third_party_package() {
             [ -z "$filename" ] && continue
             
             local download_url=$(extract_download_url_from_json "$files_json" "$filename")
-            
-            if [ -z "$download_url" ]; then
-                log "      未找到下载链接: $filename"
-                download_failed=1
-                break
-            fi
+            [ -z "$download_url" ] && { log "      未找到下载链接: $filename"; download_failed=1; break; }
             
             local temp_file="${temp_dir}/${filename}"
-            
             log "      下载: $filename"
             
             if ! curl -fsSL -o "$temp_file" -H "User-Agent: Mozilla/5.0" "$download_url" 2>/dev/null; then
@@ -428,7 +616,6 @@ install_third_party_package() {
             fi
             
             if ! validate_downloaded_file "$temp_file" 1024; then
-                log "      文件验证失败"
                 download_failed=1
                 break
             fi
@@ -452,7 +639,6 @@ install_third_party_package() {
             log "  [成功] $package_name"
             log "    版本: $latest_version"
             log "    来源: $platform"
-            log "    文件数: $(echo "$matched_files" | wc -l) 个"
             return 0
         else
             rm -rf "$temp_dir"
@@ -464,7 +650,7 @@ install_third_party_package() {
     return 1
 }
 
-# 功能: 显示使用说明
+# 功能: 使用说明
 usage() {
     cat <<EOF
 第三方软件包安装器 v${SCRIPT_VERSION}
@@ -485,12 +671,12 @@ usage() {
   0  - 成功
   1  - 失败
   2  - 已是最新版本（仅更新模式）
-  3  - auto-update.sh 已更新（仅检查脚本更新模式）
-  4  - installer 自身已更新（仅检查脚本更新模式）
+  3  - auto-update.sh 已更新
+  4  - installer 自身已更新
 EOF
 }
 
-# 功能: 主入口
+# 主入口
 main() {
     if [ $# -lt 1 ]; then
         usage
@@ -498,9 +684,6 @@ main() {
     fi
     
     load_config || return 1
-    load_common_lib || {
-        log "无法加载公共函数库，部分功能可能不可用"
-    }
     
     case "$1" in
         --check-script-update)
