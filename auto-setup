@@ -1,0 +1,671 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=01
+
+SCRIPT_VERSION="2.0.0"
+
+# 软件包列表
+PACKAGES="luci-app-wechatpush luci-app-passwall2 luci-app-openclash luci-app-filemanager luci-i18n-package-manager-zh-cn luci-i18n-firewall-zh-cn vsftpd openssh-sftp-server luci-app-ttyd lucky luci-app-tailscale luci-theme-aurora"
+
+# API源配置（格式: 平台|仓库路径|分支）
+API_SOURCES="gitee|whzhni/ipk_apk|main gitcode|whzhni/ipk_apk|main"
+
+# 脚本路径
+UPDATE_PATH="/usr/bin/auto-update.sh"
+INSTALLER_PATH="/usr/bin/third-party-installer.sh"
+COMMON_LIB_PATH="/usr/lib/auto-tools-common.sh"
+
+# 日志配置
+LOG_FILE="/tmp/auto-setup-$(date +%Y%m%d-%H%M%S).log"
+USER_AGENT="Mozilla/5.0 (compatible; OpenWrt-AutoSetup/2.0)"
+
+# 需要初始化为空的变量列表
+EMPTY_VARS="SYS_ARCH ARCH_FALLBACK PKG_EXT PKG_INSTALL PKG_UPDATE PENDING_PACKAGES FAILED_PACKAGES INSTALLED_PACKAGES THIRD_PARTY_INSTALLED_LIST AUTO_UPDATE CRON_TIME INSTALL_PRIORITY GITEE_TOKEN GITCODE_TOKEN"
+
+# 批量初始化变量
+for var in $EMPTY_VARS; do
+    eval "$var=''"
+done
+
+# 功能: 日志输出
+# 参数: $1=消息内容
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg" | tee -a "$LOG_FILE"
+    logger -t "auto-setup" "$1" 2>/dev/null || true
+}
+
+# 功能: 加载用户配置文件
+load_config() {
+    local conf="/etc/auto-setup.conf"
+    if [ -f "$conf" ]; then
+        . "$conf"
+        log "配置已加载: $conf"
+        
+        local has_issue=0
+        local required_vars="AUTO_UPDATE CRON_TIME INSTALL_PRIORITY"
+        
+        for var in $required_vars; do
+            eval "local val=\$$var"
+            if [ -z "$val" ]; then
+                log "  配置项 $var 未设置"
+                has_issue=1
+                case "$var" in
+                    AUTO_UPDATE) AUTO_UPDATE=1 ;;
+                    CRON_TIME) CRON_TIME="0 3 * * *" ;;
+                    INSTALL_PRIORITY) INSTALL_PRIORITY=1 ;;
+                esac
+            fi
+        done
+        
+        [ $has_issue -eq 0 ] && log "  所有配置项正常"
+    else
+        log "配置文件不存在，使用默认值: $conf"
+        AUTO_UPDATE=1
+        CRON_TIME="0 3 * * *"
+        INSTALL_PRIORITY=1
+        GITEE_TOKEN=""
+        GITCODE_TOKEN=""
+    fi
+}
+
+# 功能: 检测包管理器类型
+detect_package_manager() {
+    if which opkg >/dev/null 2>&1; then
+        PKG_EXT=".ipk"
+        PKG_INSTALL="opkg install"
+        PKG_UPDATE="opkg update"
+    else
+        PKG_EXT=".apk"
+        PKG_INSTALL="apk add --allow-untrusted"
+        PKG_UPDATE="apk update"
+    fi
+    log "包管理器: $(echo $PKG_INSTALL | awk '{print $1}')"
+    log "包格式: $PKG_EXT"
+}
+
+# 功能: 检测系统架构优先级列表
+detect_arch_priority() {
+    local arch_list=""
+    
+    if which opkg >/dev/null 2>&1; then
+        arch_list=$(opkg print-architecture 2>/dev/null | \
+            awk '!/^arch (all|noarch)/ {print $2, $3}' | \
+            sort -k2 -rn | \
+            awk '{print $1}')
+        arch_list="$arch_list all noarch"
+        
+    elif which apk >/dev/null 2>&1; then
+        local base_arch=$(apk --print-arch 2>/dev/null)
+        
+        case "$base_arch" in
+            aarch64)
+                if grep -qi "cortex-a53" /proc/cpuinfo; then
+                    arch_list="aarch64_cortex-a53 aarch64-cortex-a53"
+                elif grep -qi "cortex-a72" /proc/cpuinfo; then
+                    arch_list="aarch64_cortex-a72 aarch64-cortex-a72"
+                elif grep -qi "cortex-a76" /proc/cpuinfo; then
+                    arch_list="aarch64_cortex-a76 aarch64-cortex-a76"
+                fi
+                arch_list="$arch_list aarch64_generic aarch64 arm64 all"
+                ;;
+            armv7|armhf)
+                arch_list="armv7 arm_cortex-a9 arm_cortex-a7 armhf all"
+                ;;
+            x86_64)
+                arch_list="x86_64 x86-64 amd64 all"
+                ;;
+            *)
+                arch_list="$base_arch all"
+                ;;
+        esac
+        
+    else
+        local cpu_arch=$(uname -m)
+        case "$cpu_arch" in
+            aarch64)
+                local cpu_part=$(awk '/CPU part/ {print $4; exit}' /proc/cpuinfo)
+                case "$cpu_part" in
+                    0xd03) arch_list="aarch64_cortex-a53 aarch64-cortex-a53" ;;
+                    0xd08) arch_list="aarch64_cortex-a72 aarch64-cortex-a72" ;;
+                    0xd0b) arch_list="aarch64_cortex-a76 aarch64-cortex-a76" ;;
+                esac
+                arch_list="$arch_list aarch64_generic aarch64 arm64 all"
+                ;;
+            armv7l)
+                arch_list="armv7 arm_cortex-a9 arm_cortex-a7 all"
+                ;;
+            x86_64)
+                arch_list="x86_64 x86-64 amd64 all"
+                ;;
+            mipsel)
+                arch_list="mipsel_24kc mipsel all"
+                ;;
+            *)
+                arch_list="$cpu_arch all"
+                ;;
+        esac
+    fi
+    
+    echo "$arch_list" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# 功能: 初始化架构信息
+init_arch() {
+    local full_list=$(detect_arch_priority)
+    
+    SYS_ARCH=$(echo "$full_list" | awk '{print $1}')
+    ARCH_FALLBACK="$full_list"
+    
+    log "系统架构: $SYS_ARCH"
+    log "架构回退列表: $ARCH_FALLBACK"
+}
+
+# 功能: 检查包是否已安装
+# 参数: $1=包名
+# 返回: 0=已安装, 1=未安装
+is_installed() {
+    if echo "$PKG_INSTALL" | grep -q "opkg"; then
+        opkg list-installed | grep -q "^$1 "
+    else
+        apk info -e "$1" >/dev/null 2>&1
+    fi
+}
+
+# 功能: 从官方源安装单个包
+# 参数: $1=包名
+# 返回: 0=成功, 1=失败
+install_pkg_official() {
+    local pkg="$1"
+    pkg=$(echo "$pkg" | xargs)
+    [ -z "$pkg" ] && return 1
+    
+    log "  安装 $pkg"
+    
+    if $PKG_INSTALL "$pkg" >>"$LOG_FILE" 2>&1; then
+        log "  安装成功: $pkg"
+        INSTALLED_PACKAGES="$INSTALLED_PACKAGES $pkg"
+        
+        local lang=""
+        case "$pkg" in
+            luci-app-*) lang="luci-i18n-${pkg#luci-app-}-zh-cn" ;;
+            luci-theme-*) lang="luci-i18n-theme-${pkg#luci-theme-}-zh-cn" ;;
+        esac
+        
+        if [ -n "$lang" ] && ! is_installed "$lang"; then
+            local lang_exists=0
+            if echo "$PKG_INSTALL" | grep -q "opkg"; then
+                opkg list 2>/dev/null | grep -q "^$lang " && lang_exists=1
+            else
+                apk search "$lang" 2>/dev/null | grep -q "^$lang" && lang_exists=1
+            fi
+            
+            if [ $lang_exists -eq 1 ]; then
+                log "  安装语言包 $lang"
+                if $PKG_INSTALL "$lang" >>"$LOG_FILE" 2>&1; then
+                    log "  语言包安装成功"
+                else
+                    log "  语言包安装失败（不影响主程序）"
+                fi
+            fi
+        fi
+        return 0
+    else
+        log "  安装失败: $pkg"
+        return 1
+    fi
+}
+
+# 功能: 从官方源安装包列表
+# 参数: $1=包列表（空格分隔）
+install_official() {
+    local pkg_list="$1"
+    
+    log "[步骤] 从官方源安装"
+    
+    if [ -z "$pkg_list" ]; then
+        log "没有需要安装的包"
+        return 0
+    fi
+    
+    log "待安装包列表:"
+    for pkg in $pkg_list; do
+        pkg=$(echo "$pkg" | xargs)
+        [ -z "$pkg" ] && continue
+        log "  - $pkg"
+    done
+
+    local ok=0 fail=0 skip=0
+    local failed_list=""
+    
+    for pkg in $pkg_list; do
+        pkg=$(echo "$pkg" | xargs)
+        [ -z "$pkg" ] && continue
+        
+        if is_installed "$pkg"; then
+            log "跳过已安装: $pkg"
+            skip=$((skip + 1))
+            continue
+        fi
+        
+        if install_pkg_official "$pkg"; then
+            ok=$((ok + 1))
+        else
+            failed_list="$failed_list $pkg"
+            fail=$((fail + 1))
+        fi
+    done
+    
+    PENDING_PACKAGES="$failed_list"
+    
+    log "官方源安装完成: 成功${ok}个 失败${fail}个 跳过${skip}个"
+    
+    if [ -n "$failed_list" ]; then
+        log "失败列表:"
+        for pkg in $failed_list; do
+            pkg=$(echo "$pkg" | xargs)
+            [ -z "$pkg" ] && continue
+            log "  - $pkg"
+        done
+    fi
+    
+    return 0
+}
+
+# 功能: 调用第三方安装器安装包
+# 参数: $1=包名
+# 返回: 0=成功, 1=失败
+install_pkg_third_party() {
+    local pkg="$1"
+    
+    log "  调用第三方安装器: $pkg"
+    
+    if [ ! -x "$INSTALLER_PATH" ]; then
+        log "  第三方安装器不存在: $INSTALLER_PATH"
+        return 1
+    fi
+    
+    "$INSTALLER_PATH" install "$pkg"
+    
+    if [ $? -eq 0 ]; then
+        log "  安装成功: $pkg"
+        INSTALLED_PACKAGES="$INSTALLED_PACKAGES $pkg"
+        THIRD_PARTY_INSTALLED_LIST="$THIRD_PARTY_INSTALLED_LIST $pkg"
+        return 0
+    else
+        log "  安装失败: $pkg"
+        return 1
+    fi
+}
+
+# 功能: 从第三方源安装包列表
+# 参数: $1=包列表
+install_third_party() {
+    local pkg_list="$1"
+    
+    log "[步骤] 从第三方源安装"
+    
+    if [ -z "$pkg_list" ]; then
+        log "没有需要安装的包"
+        return 0
+    fi
+    
+    if [ ! -x "$INSTALLER_PATH" ]; then
+        log "第三方安装器未就绪: $INSTALLER_PATH"
+        log "跳过第三方源安装"
+        PENDING_PACKAGES="$pkg_list"
+        return 1
+    fi
+    
+    log "待安装包列表:"
+    for pkg in $pkg_list; do
+        pkg=$(echo "$pkg" | xargs)
+        [ -z "$pkg" ] && continue
+        log "  - $pkg"
+    done
+    
+    local ok=0 fail=0 skip=0
+    local done_list="" failed_list=""
+    
+    for pkg in $pkg_list; do
+        pkg=$(echo "$pkg" | xargs)
+        [ -z "$pkg" ] && continue
+        
+        local main="$pkg"
+        case "$pkg" in
+            luci-i18n-theme-*-zh-cn)
+                local tmp="${pkg#luci-i18n-theme-}"
+                main="luci-theme-${tmp%-zh-cn}"
+                ;;
+            luci-i18n-*-zh-cn)
+                local tmp="${pkg#luci-i18n-}"
+                tmp="${tmp%-zh-cn}"
+                if echo " $pkg_list " | grep -q " luci-theme-${tmp} "; then
+                    main="luci-theme-${tmp}"
+                else
+                    main="luci-app-${tmp}"
+                fi
+                ;;
+        esac
+        
+        case " $done_list " in
+            *" $main "*)
+                log "跳过重复: $main"
+                skip=$((skip + 1))
+                continue
+                ;;
+        esac
+        done_list="$done_list $main "
+        
+        if is_installed "$main"; then
+            log "跳过已安装: $main"
+            skip=$((skip + 1))
+            continue
+        fi
+        
+        if install_pkg_third_party "$main"; then
+            ok=$((ok + 1))
+        else
+            failed_list="$failed_list $main"
+            fail=$((fail + 1))
+        fi
+    done
+    
+    PENDING_PACKAGES="$failed_list"
+    
+    log "第三方源安装完成: 成功${ok}个 失败${fail}个 跳过${skip}个"
+    
+    if [ -n "$failed_list" ]; then
+        log "失败列表:"
+        for pkg in $failed_list; do
+            pkg=$(echo "$pkg" | xargs)
+            [ -z "$pkg" ] && continue
+            log "  - $pkg"
+        done
+    fi
+    
+    return 0
+}
+
+# 功能: 执行软件包安装流程
+run_install() {
+    if [ "$INSTALL_PRIORITY" = "1" ]; then
+        log "[策略] 优先官方源，第三方源备用"
+        
+        PENDING_PACKAGES="$PACKAGES"
+        install_official "$PENDING_PACKAGES"
+        
+        if [ -n "$PENDING_PACKAGES" ]; then
+            install_third_party "$PENDING_PACKAGES"
+        fi
+    else
+        log "[策略] 优先第三方源，官方源备用"
+        
+        PENDING_PACKAGES="$PACKAGES"
+        install_third_party "$PENDING_PACKAGES"
+        
+        if [ -n "$PENDING_PACKAGES" ]; then
+            install_official "$PENDING_PACKAGES"
+        fi
+    fi
+    
+    FAILED_PACKAGES="$PENDING_PACKAGES"
+}
+
+# 功能: 保存配置到文件
+save_third_party_list() {
+    local conf="/etc/auto-setup.conf"
+    
+    local pkg_list=$(echo "$THIRD_PARTY_INSTALLED_LIST" | xargs | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
+    
+    if [ ! -f "$conf" ]; then
+        log "配置文件不存在，无法保存"
+        return 1
+    fi
+    
+    if grep -q "^THIRD_PARTY_INSTALLED=" "$conf"; then
+        sed -i "s|^THIRD_PARTY_INSTALLED=.*|THIRD_PARTY_INSTALLED=\"$pkg_list\"|" "$conf"
+    else
+        echo "" >> "$conf"
+        echo "# 第三方安装列表" >> "$conf"
+        echo "THIRD_PARTY_INSTALLED=\"$pkg_list\"" >> "$conf"
+    fi
+    
+    if ! grep -q "^SYS_ARCH=" "$conf"; then
+        echo "" >> "$conf"
+        echo "# 系统信息" >> "$conf"
+        echo "SYS_ARCH=\"$SYS_ARCH\"" >> "$conf"
+        echo "ARCH_FALLBACK=\"$ARCH_FALLBACK\"" >> "$conf"
+        echo "PKG_EXT=\"$PKG_EXT\"" >> "$conf"
+        echo "PKG_INSTALL=\"$PKG_INSTALL\"" >> "$conf"
+    else
+        sed -i "s|^SYS_ARCH=.*|SYS_ARCH=\"$SYS_ARCH\"|" "$conf"
+        sed -i "s|^ARCH_FALLBACK=.*|ARCH_FALLBACK=\"$ARCH_FALLBACK\"|" "$conf"
+        sed -i "s|^PKG_EXT=.*|PKG_EXT=\"$PKG_EXT\"|" "$conf"
+        sed -i "s|^PKG_INSTALL=.*|PKG_INSTALL=\"$PKG_INSTALL\"|" "$conf"
+    fi
+    
+    local sources_escaped=$(echo "$API_SOURCES" | sed 's/"/\\"/g')
+    if ! grep -q "^API_SOURCES=" "$conf"; then
+        echo "" >> "$conf"
+        echo "# API源配置" >> "$conf"
+        echo "API_SOURCES=\"$sources_escaped\"" >> "$conf"
+    else
+        sed -i "s|^API_SOURCES=.*|API_SOURCES=\"$sources_escaped\"|" "$conf"
+    fi
+    
+    if [ -n "$pkg_list" ]; then
+        log "已保存第三方安装列表: $pkg_list"
+    fi
+    
+    log "已保存系统信息: 架构=$SYS_ARCH 格式=$PKG_EXT"
+}
+
+# 功能: 从多个API源下载文件（简化版，仅用于下载脚本）
+# 参数: $1=文件名, $2=输出路径, $3=描述
+# 返回: 0=成功, 1=失败
+download_script_file() {
+    local filename="$1"
+    local output_path="$2"
+    local description="${3:-文件}"
+    
+    log "下载 $description: $filename"
+    
+    for source_config in $API_SOURCES; do
+        local platform=$(echo "$source_config" | cut -d'|' -f1)
+        local repo=$(echo "$source_config" | cut -d'|' -f2)
+        
+        log "  尝试源: $platform"
+        
+        local base_url=""
+        case "$platform" in
+            gitee)
+                base_url="https://gitee.com/${repo}/raw/main"
+                ;;
+            gitcode)
+                base_url="https://gitcode.com/${repo}/raw/main"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        
+        local download_url="${base_url}/${filename}"
+        
+        log "  下载中..."
+        
+        if curl -fsSL -o "$output_path" -H "User-Agent: $USER_AGENT" "$download_url" 2>/dev/null; then
+            if [ -f "$output_path" ] && [ -s "$output_path" ]; then
+                local size=$(wc -c < "$output_path" 2>/dev/null | tr -d ' ')
+                if [ "$size" -gt 1024 ]; then
+                    log "  下载成功 (${size} 字节)"
+                    return 0
+                fi
+            fi
+            rm -f "$output_path"
+        fi
+        
+        log "  下载失败"
+    done
+    
+    log "所有源均下载失败: $description"
+    return 1
+}
+
+# 功能: 下载公共函数库
+setup_common_lib() {
+    log "[步骤] 下载公共函数库"
+    
+    mkdir -p "$(dirname "$COMMON_LIB_PATH")"
+    
+    if download_script_file "auto-tools-common.sh" "$COMMON_LIB_PATH" "公共函数库"; then
+        chmod +x "$COMMON_LIB_PATH"
+        log "公共函数库已就绪: $COMMON_LIB_PATH"
+        return 0
+    else
+        log "公共函数库下载失败"
+        return 1
+    fi
+}
+
+# 功能: 下载第三方安装器（必需）
+setup_third_party_installer() {
+    log "[步骤] 下载第三方安装器"
+    
+    mkdir -p "$(dirname "$INSTALLER_PATH")"
+    
+    if download_script_file "third-party-installer.sh" "$INSTALLER_PATH" "第三方安装器"; then
+        chmod +x "$INSTALLER_PATH"
+        
+        local conf="/etc/auto-setup.conf"
+        if ! grep -q "^THIRD_PARTY_INSTALLER=" "$conf"; then
+            echo "" >> "$conf"
+            echo "# 第三方安装器路径" >> "$conf"
+            echo "THIRD_PARTY_INSTALLER=\"$INSTALLER_PATH\"" >> "$conf"
+        fi
+        
+        log "第三方安装器已就绪: $INSTALLER_PATH"
+        return 0
+    else
+        log "第三方安装器下载失败"
+        return 1
+    fi
+}
+
+# 功能: 下载自动更新脚本（可选）
+setup_auto_update() {
+    log "[步骤] 配置自动更新"
+    
+    mkdir -p "$(dirname "$UPDATE_PATH")"
+    
+    if download_script_file "auto-update.sh" "$UPDATE_PATH" "自动更新脚本"; then
+        chmod +x "$UPDATE_PATH"
+        
+        if (crontab -l 2>/dev/null | grep -v "$UPDATE_PATH"; \
+            echo "$CRON_TIME $UPDATE_PATH") | crontab -; then
+            log "定时任务添加成功: $CRON_TIME"
+            return 0
+        else
+            log "定时任务添加失败"
+            return 1
+        fi
+    else
+        log "自动更新脚本下载失败"
+        return 1
+    fi
+}
+
+# 功能: 删除自身
+remove_self() {
+    log "[步骤] 清理自动配置脚本"
+    rm -f /etc/rc.d/S99auto-setup /etc/rc.d/K01auto-setup 2>/dev/null
+    rm -f /etc/init.d/auto-setup 2>/dev/null
+    sleep 2
+    
+    if [ ! -f "/etc/init.d/auto-setup" ]; then
+        log "自动配置脚本已删除"
+        if echo " $INSTALLED_PACKAGES " | grep -q " luci-proto-wireguard "; then
+            log "检测到 luci-proto-wireguard 已安装"
+            log "系统将在10秒后重启以使其生效"
+            sleep 10
+            reboot
+        fi
+    else
+        log "脚本删除失败，取消操作避免重启循环"
+    fi
+}
+
+# 功能: 主安装流程
+run_setup() {
+    log "[开始] 自动配置 (PID: $$)"
+    log "日志文件: $LOG_FILE"
+    
+    load_config
+    detect_package_manager
+    init_arch
+    
+    if $PKG_UPDATE >>"$LOG_FILE" 2>&1; then
+        log "软件源刷新成功"
+    else
+        log "软件源刷新失败，继续尝试安装"
+    fi
+    
+    log "[重要] 下载必需组件"
+    
+    if ! setup_common_lib; then
+        log "公共函数库下载失败，但继续执行"
+    fi
+    
+    if ! setup_third_party_installer; then
+        log "第三方安装器下载失败"
+        log "将只能安装官方源的包"
+    fi
+    
+    run_install
+    
+    log "[安装] 流程完成"
+    
+    if [ -z "$FAILED_PACKAGES" ]; then
+        log "所有软件包安装成功"
+    else
+        log "以下软件包安装失败:"
+        for pkg in $FAILED_PACKAGES; do
+            pkg=$(echo "$pkg" | xargs)
+            [ -z "$pkg" ] && continue
+            log "  - $pkg"
+        done
+    fi
+    
+    save_third_party_list
+    
+    log "完整日志: $LOG_FILE"
+    
+    if [ -z "$FAILED_PACKAGES" ]; then
+        if [ "$AUTO_UPDATE" = "1" ]; then
+            log "自动更新: 启用"
+            
+            if setup_auto_update; then
+                log "自动更新配置成功"
+                remove_self
+            else
+                log "自动更新配置失败，保留脚本等待重试"
+            fi
+        else
+            log "自动更新: 禁用"
+            remove_self
+        fi
+    else
+        log "有包安装失败，保留脚本"
+    fi
+}
+
+# 功能: 服务启动
+start() {
+    (run_setup) &
+}
+
+# 功能: 服务停止
+stop() {
+    log "停止自动配置服务"
+}
