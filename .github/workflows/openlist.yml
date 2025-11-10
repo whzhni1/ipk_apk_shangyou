@@ -1,17 +1,20 @@
 name: 构建 OpenList2 软件包
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 手动触发
   schedule:
-    - cron: '0 19 * * *'
+    - cron: '0 19 * * *'  # 北京时间 3:00 AM = UTC 19:00
 
 env:
-  SOURCE_REPO: sbwml/luci-app-openlist2
-  TARGET_REPO: whzhni1/ipk_apk
-  TARGET_DIR: openlist
+  SOURCE_REPO: sbwml/luci-app-openlist2      # 上游仓库
+  TARGET_REPO: whzhni1/ipk_apk               # 目标仓库
+  TARGET_DIR: openlist                       # 目标目录
   BRANCH: main
 
 jobs:
+  # ========================================
+  # 阶段1: 检查版本
+  # ========================================
   check-version:
     runs-on: ubuntu-latest
     outputs:
@@ -25,6 +28,7 @@ jobs:
         run: |
           echo "🔍 检查上游仓库最新版本..."
           
+          # 获取最新 tag
           LATEST_TAG=$(curl -s "https://api.github.com/repos/${{ env.SOURCE_REPO }}/tags" | \
             jq -r '.[0].name')
           
@@ -62,6 +66,7 @@ jobs:
             exit 0
           fi
           
+          # 获取本地版本（目录名）
           CURRENT_VERSION=$(ls -1 "${{ env.TARGET_DIR }}" 2>/dev/null | grep -v "^\." | head -n 1)
           
           if [ -z "$CURRENT_VERSION" ]; then
@@ -87,6 +92,9 @@ jobs:
             echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
           fi
 
+  # ========================================
+  # 阶段2: 编译软件包
+  # ========================================
   build:
     name: 构建 ${{ matrix.arch }}-${{ matrix.sdk }}
     runs-on: ubuntu-latest
@@ -202,6 +210,9 @@ jobs:
           retention-days: 1
           if-no-files-found: warn
 
+  # ========================================
+  # 阶段3: 收集并推送到目标仓库
+  # ========================================
   deploy:
     runs-on: ubuntu-latest
     needs: [check-version, build]
@@ -227,6 +238,41 @@ jobs:
           path: artifacts
           merge-multiple: false
 
+      - name: 检查下载的文件结构
+        run: |
+          echo "========================================="
+          echo "📁 检查 Artifacts 目录结构"
+          echo "========================================="
+          echo ""
+          
+          # 显示目录树
+          echo "目录树（前3层）："
+          find artifacts -maxdepth 3 -type d | head -20
+          
+          echo ""
+          echo "========================================="
+          echo "📦 各 Artifact 文件列表"
+          echo "========================================="
+          
+          for artifact_dir in artifacts/packages-*/; do
+            if [ -d "$artifact_dir" ]; then
+              artifact_name=$(basename "$artifact_dir")
+              echo ""
+              echo "📁 $artifact_name"
+              echo "---"
+              
+              # 递归查找所有 ipk 和 apk 文件
+              echo "IPK 文件："
+              find "$artifact_dir" -type f -name "*.ipk" -exec echo "  {}" \; || echo "  无"
+              
+              echo "APK 文件："
+              find "$artifact_dir" -type f -name "*.apk" -exec echo "  {}" \; || echo "  无"
+            fi
+          done
+          
+          echo ""
+          echo "========================================="
+
       - name: 整理文件
         run: |
           LATEST_VERSION="${{ needs.check-version.outputs.latest_version }}"
@@ -242,9 +288,8 @@ jobs:
           mkdir -p "${{ env.TARGET_DIR }}/$LATEST_VERSION"
           
           # 统计变量
-          declare -A file_count
-          file_count[ipk]=0
-          file_count[apk]=0
+          IPK_COUNT=0
+          APK_COUNT=0
           
           # 遍历所有 artifact
           for artifact_dir in artifacts/packages-*/; do
@@ -255,27 +300,25 @@ jobs:
             artifact_name=$(basename "$artifact_dir")
             echo "📁 处理: $artifact_name"
             
-            # 显示此 artifact 中的文件
-            ipk_files=$(find "$artifact_dir" -name "*.ipk" 2>/dev/null | wc -l)
-            apk_files=$(find "$artifact_dir" -name "*.apk" 2>/dev/null | wc -l)
+            # 递归查找并复制 IPK 文件
+            while IFS= read -r file; do
+              if [ -f "$file" ]; then
+                filename=$(basename "$file")
+                cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
+                echo "   ✅ IPK: $filename"
+                IPK_COUNT=$((IPK_COUNT + 1))
+              fi
+            done < <(find "$artifact_dir" -type f -name "*.ipk")
             
-            echo "   IPK: $ipk_files 个, APK: $apk_files 个"
-            
-            # 复制 IPK 文件
-            find "$artifact_dir" -type f -name "*.ipk" | while read file; do
-              filename=$(basename "$file")
-              cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
-              echo "   ✅ IPK: $filename"
-              file_count[ipk]=$((file_count[ipk] + 1))
-            done
-            
-            # 复制 APK 文件
-            find "$artifact_dir" -type f -name "*.apk" | while read file; do
-              filename=$(basename "$file")
-              cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
-              echo "   ✅ APK: $filename"
-              file_count[apk]=$((file_count[apk] + 1))
-            done
+            # 递归查找并复制 APK 文件
+            while IFS= read -r file; do
+              if [ -f "$file" ]; then
+                filename=$(basename "$file")
+                cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
+                echo "   ✅ APK: $filename"
+                APK_COUNT=$((APK_COUNT + 1))
+              fi
+            done < <(find "$artifact_dir" -type f -name "*.apk")
             
             echo ""
           done
@@ -288,21 +331,34 @@ jobs:
           echo "========================================="
           echo "📊 文件统计"
           echo "========================================="
-          echo "IPK 文件: $FINAL_IPK 个"
-          echo "APK 文件: $FINAL_APK 个"
-          echo "总计: $TOTAL_FILES 个"
+          echo "复制过程统计:"
+          echo "  IPK: $IPK_COUNT 个"
+          echo "  APK: $APK_COUNT 个"
+          echo ""
+          echo "最终目录统计:"
+          echo "  IPK: $FINAL_IPK 个"
+          echo "  APK: $FINAL_APK 个"
+          echo "  总计: $TOTAL_FILES 个"
           echo ""
           
           # 删除旧版本
           if [ "$CURRENT_VERSION" != "none" ] && [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
             echo "🗑️  删除旧版本: $CURRENT_VERSION"
             rm -rf "${{ env.TARGET_DIR }}/$CURRENT_VERSION"
+            echo ""
           fi
           
-          # 显示部分文件列表
+          # 按类型显示文件
+          echo "========================================="
+          echo "📁 IPK 文件列表（前10个）"
+          echo "========================================="
+          find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -name "*.ipk" -exec basename {} \; | head -10
+          
           echo ""
-          echo "📁 文件列表（前20个）:"
-          ls -lh "${{ env.TARGET_DIR }}/$LATEST_VERSION" | head -21
+          echo "========================================="
+          echo "📁 APK 文件列表（前10个）"
+          echo "========================================="
+          find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -name "*.apk" -exec basename {} \; | head -10
           
           echo ""
           echo "✅ 整理完成"
@@ -353,6 +409,9 @@ jobs:
           
           echo "✅ 部署完成"
 
+  # ========================================
+  # 阶段4: 生成报告
+  # ========================================
   report:
     runs-on: ubuntu-latest
     needs: [check-version, build, deploy]
@@ -405,7 +464,7 @@ jobs:
           - **IPK 格式**: OpenWrt 24.10 版本（传统格式）
           - **APK 格式**: SNAPSHOT 版本（新格式，Alpine Package Keeper）
           - **架构数量**: 33 个架构
-          - **理论文件数**: 约 66+ 个（每个架构 × 2 个 SDK + 架构无关包）
+          - **理论文件数**: 约 70 个（每个架构 × 2 个 SDK + 架构无关包）
           
           > **注意**: luci-app 和 luci-i18n 包是架构无关的（all），每个 SDK 只生成一个。  
           > openlist2 核心包是架构相关的，每个架构生成一个。
