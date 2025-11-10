@@ -7,13 +7,14 @@ on:
     types:
       - completed
   schedule:
-    - cron: '30 19 * * *'  # 北京时间 3:30 AM = UTC 19:30 (在主同步后30分钟)
+    - cron: '30 19 * * *'
 
 env:
   BRANCH: main
-  USERNAME: whzhni1
+  GITEE_USERNAME: whzhni       # Gitee 用户名
+  GITCODE_USERNAME: whzhni     # GitCode 用户名
   REPO: ipk_apk
-  SOURCE_REPO: whzhni1/ipk_apk  # 源仓库
+  SOURCE_REPO: whzhni1/ipk_apk # GitHub 源仓库
 
 jobs:
   sync-gitee:
@@ -28,9 +29,9 @@ jobs:
       - name: 检出源仓库代码
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.SOURCE_REPO }}  # 从 whzhni1/ipk_apk 检出
+          repository: ${{ env.SOURCE_REPO }}
           fetch-depth: 0
-          token: ${{ secrets.PAT_TOKEN }}  # 使用 PAT Token
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: 设置 Git 配置
         run: |
@@ -52,11 +53,17 @@ jobs:
           
           echo "configured=已设置" >> $GITHUB_OUTPUT
           
+          echo "========================================="
           echo "📋 源仓库: ${{ env.SOURCE_REPO }}"
-          echo "🎯 目标: Gitee - ${{ env.USERNAME }}/${{ env.REPO }}"
+          echo "🎯 目标仓库: https://gitee.com/${{ env.GITEE_USERNAME }}/${{ env.REPO }}"
+          echo "========================================="
           
-          git remote add gitee https://oauth2:${GITEE_TOKEN}@gitee.com/${{ env.USERNAME }}/${{ env.REPO }}.git || true
-          git fetch gitee || true
+          # 添加或更新远程仓库
+          git remote add gitee https://oauth2:${GITEE_TOKEN}@gitee.com/${{ env.GITEE_USERNAME }}/${{ env.REPO }}.git 2>/dev/null || \
+          git remote set-url gitee https://oauth2:${GITEE_TOKEN}@gitee.com/${{ env.GITEE_USERNAME }}/${{ env.REPO }}.git
+          
+          # 推送到 Gitee
+          echo "🚀 开始推送..."
           git push gitee +${{ env.BRANCH }}:${{ env.BRANCH }}
           
           END_TIME=$(date +%s)
@@ -77,9 +84,9 @@ jobs:
       - name: 检出源仓库代码
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.SOURCE_REPO }}  # 从 whzhni1/ipk_apk 检出
+          repository: ${{ env.SOURCE_REPO }}
           fetch-depth: 0
-          token: ${{ secrets.PAT_TOKEN }}  # 使用 PAT Token
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: 设置 Git 配置
         run: |
@@ -101,11 +108,17 @@ jobs:
           
           echo "configured=已设置" >> $GITHUB_OUTPUT
           
+          echo "========================================="
           echo "📋 源仓库: ${{ env.SOURCE_REPO }}"
-          echo "🎯 目标: GitCode - ${{ env.USERNAME }}/${{ env.REPO }}"
+          echo "🎯 目标仓库: https://gitcode.com/${{ env.GITCODE_USERNAME }}/${{ env.REPO }}"
+          echo "========================================="
           
-          git remote add gitcode https://oauth2:${GITCODE_TOKEN}@gitcode.com/${{ env.USERNAME }}/${{ env.REPO }}.git || true
-          git fetch gitcode || true
+          # 添加或更新远程仓库
+          git remote add gitcode https://oauth2:${GITCODE_TOKEN}@gitcode.com/${{ env.GITCODE_USERNAME }}/${{ env.REPO }}.git 2>/dev/null || \
+          git remote set-url gitcode https://oauth2:${GITCODE_TOKEN}@gitcode.com/${{ env.GITCODE_USERNAME }}/${{ env.REPO }}.git
+          
+          # 推送到 GitCode
+          echo "🚀 开始推送..."
           git push gitcode +${{ env.BRANCH }}:${{ env.BRANCH }}
           
           END_TIME=$(date +%s)
@@ -190,20 +203,19 @@ jobs:
           
           ### 🌐 镜像仓库地址
           
-          - 🐙 **GitHub**: https://github.com/${{ env.USERNAME }}/${{ env.REPO }}
-          - 🟠 **Gitee**: https://gitee.com/${{ env.USERNAME }}/${{ env.REPO }}
-          - 🔵 **GitCode**: https://gitcode.com/${{ env.USERNAME }}/${{ env.REPO }}
+          - 🐙 **GitHub**: https://github.com/${{ env.SOURCE_REPO }}
+          - 🟠 **Gitee**: https://gitee.com/${{ env.GITEE_USERNAME }}/${{ env.REPO }}
+          - 🔵 **GitCode**: https://gitcode.com/${{ env.GITCODE_USERNAME }}/${{ env.REPO }}
           
           ---
           
-          ### 📝 配置说明
+          ### 📌 配置说明
           
           $(if [ "$GITEE_CONFIGURED" == "未设置" ]; then
-            echo "**Gitee**: 需在仓库 Settings → Secrets 中添加 \`GITEE_TOKEN\`"
+            echo "- ⚙️ **Gitee**: 需在仓库 Settings → Secrets 中添加 \`GITEE_TOKEN\`"
           fi)
-          
           $(if [ "$GITCODE_CONFIGURED" == "未设置" ]; then
-            echo "**GitCode**: 需在仓库 Settings → Secrets 中添加 \`GITCODE_TOKEN\`"
+            echo "- ⚙️ **GitCode**: 需在仓库 Settings → Secrets 中添加 \`GITCODE_TOKEN\`"
           fi)
           EOF
           
