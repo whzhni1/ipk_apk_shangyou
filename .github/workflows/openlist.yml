@@ -238,41 +238,6 @@ jobs:
           path: artifacts
           merge-multiple: false
 
-      - name: 检查下载的文件结构
-        run: |
-          echo "========================================="
-          echo "📁 检查 Artifacts 目录结构"
-          echo "========================================="
-          echo ""
-          
-          # 显示目录树
-          echo "目录树（前3层）："
-          find artifacts -maxdepth 3 -type d | head -20
-          
-          echo ""
-          echo "========================================="
-          echo "📦 各 Artifact 文件列表"
-          echo "========================================="
-          
-          for artifact_dir in artifacts/packages-*/; do
-            if [ -d "$artifact_dir" ]; then
-              artifact_name=$(basename "$artifact_dir")
-              echo ""
-              echo "📁 $artifact_name"
-              echo "---"
-              
-              # 递归查找所有 ipk 和 apk 文件
-              echo "IPK 文件："
-              find "$artifact_dir" -type f -name "*.ipk" -exec echo "  {}" \; || echo "  无"
-              
-              echo "APK 文件："
-              find "$artifact_dir" -type f -name "*.apk" -exec echo "  {}" \; || echo "  无"
-            fi
-          done
-          
-          echo ""
-          echo "========================================="
-
       - name: 整理文件
         run: |
           LATEST_VERSION="${{ needs.check-version.outputs.latest_version }}"
@@ -291,6 +256,9 @@ jobs:
           IPK_COUNT=0
           APK_COUNT=0
           
+          # 用于跟踪架构无关的包（避免重复）
+          declare -A processed_files
+          
           # 遍历所有 artifact
           for artifact_dir in artifacts/packages-*/; do
             if [ ! -d "$artifact_dir" ]; then
@@ -298,25 +266,62 @@ jobs:
             fi
             
             artifact_name=$(basename "$artifact_dir")
-            echo "📁 处理: $artifact_name"
             
-            # 递归查找并复制 IPK 文件
+            # 从 artifact 名称提取架构和 SDK
+            arch=$(echo "$artifact_name" | sed 's/^packages-//' | sed 's/-openwrt-24.10$//' | sed 's/-SNAPSHOT$//')
+            sdk=$(echo "$artifact_name" | grep -oE '(openwrt-24\.10|SNAPSHOT)$')
+            
+            echo "📁 处理: $artifact_name (架构: $arch, SDK: $sdk)"
+            
+            # 处理 IPK 文件
             while IFS= read -r file; do
               if [ -f "$file" ]; then
                 filename=$(basename "$file")
-                cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
-                echo "   ✅ IPK: $filename"
-                IPK_COUNT=$((IPK_COUNT + 1))
+                
+                # 检查是否为架构无关的包
+                if [[ "$filename" == *"_all.ipk" ]]; then
+                  if [ -z "${processed_files[$filename]}" ]; then
+                    cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
+                    echo "   ✅ IPK (通用): $filename"
+                    processed_files[$filename]=1
+                    IPK_COUNT=$((IPK_COUNT + 1))
+                  else
+                    echo "   ⏭️  IPK (跳过): $filename"
+                  fi
+                else
+                  cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
+                  echo "   ✅ IPK: $filename"
+                  IPK_COUNT=$((IPK_COUNT + 1))
+                fi
               fi
             done < <(find "$artifact_dir" -type f -name "*.ipk")
             
-            # 递归查找并复制 APK 文件
+            # 处理 APK 文件
             while IFS= read -r file; do
               if [ -f "$file" ]; then
-                filename=$(basename "$file")
-                cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
-                echo "   ✅ APK: $filename"
-                APK_COUNT=$((APK_COUNT + 1))
+                original_filename=$(basename "$file")
+                
+                # 检查是否为架构无关的包
+                if [[ "$original_filename" == luci-* ]]; then
+                  unique_key="${original_filename}_${sdk}"
+                  
+                  if [ -z "${processed_files[$unique_key]}" ]; then
+                    new_filename="${original_filename%.apk}_${sdk}.apk"
+                    cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/$new_filename"
+                    echo "   ✅ APK (通用): $new_filename"
+                    processed_files[$unique_key]=1
+                    APK_COUNT=$((APK_COUNT + 1))
+                  else
+                    echo "   ⏭️  APK (跳过): $original_filename"
+                  fi
+                else
+                  base_name="${original_filename%.apk}"
+                  new_filename="${base_name}_${arch}.apk"
+                  
+                  cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/$new_filename"
+                  echo "   ✅ APK: $new_filename"
+                  APK_COUNT=$((APK_COUNT + 1))
+                fi
               fi
             done < <(find "$artifact_dir" -type f -name "*.apk")
             
@@ -352,13 +357,13 @@ jobs:
           echo "========================================="
           echo "📁 IPK 文件列表（前10个）"
           echo "========================================="
-          find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -name "*.ipk" -exec basename {} \; | head -10
+          find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -name "*.ipk" | head -10 | xargs -I {} basename {}
           
           echo ""
           echo "========================================="
           echo "📁 APK 文件列表（前10个）"
           echo "========================================="
-          find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -name "*.apk" -exec basename {} \; | head -10
+          find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -name "*.apk" | head -10 | xargs -I {} basename {}
           
           echo ""
           echo "✅ 整理完成"
