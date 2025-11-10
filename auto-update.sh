@@ -20,11 +20,11 @@ done
 
 CONFIG_BACKED_UP=0
 
+exec >> "$LOG_FILE" 2>&1
+
 # 功能: 日志输出
-# 参数: $1=消息内容
 log() {
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    echo "$msg" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
     logger -t "auto-update" "$1" 2>/dev/null || true
 }
 
