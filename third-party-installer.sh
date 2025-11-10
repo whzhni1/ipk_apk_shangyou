@@ -14,17 +14,9 @@ for var in $EMPTY_VARS; do
     eval "$var=''"
 done
 
-# 功能: 日志输出（优先使用父进程的LOG_FILE）
-# 参数: $1=消息内容
+# 功能: 日志输出
 log() {
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    echo "$msg"
-    
-    if [ -n "$LOG_FILE" ]; then
-        echo "$msg" >> "$LOG_FILE"
-    fi
-    
-    logger -t "third-party-installer" "$1" 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
 # 功能: 加载配置文件
@@ -65,9 +57,6 @@ load_common_lib() {
 }
 
 # 功能: 获取仓库元数据（带缓存）
-# 参数: $1=是否强制刷新(0/1，默认0)
-# 输出: JSON元数据
-# 返回: 0=成功, 1=失败
 get_repo_metadata() {
     local force_refresh="${1:-0}"
     
@@ -112,8 +101,6 @@ get_repo_metadata() {
 }
 
 # 功能: 检查单个脚本的更新
-# 参数: $1=元数据JSON, $2=脚本文件名, $3=本地路径
-# 返回: 0=已更新, 1=无需更新或失败
 check_single_script() {
     local metadata="$1"
     local script_name="$2"
@@ -158,8 +145,7 @@ check_single_script() {
     return 0
 }
 
-# 功能: 检查脚本更新（auto-update.sh 和自身）
-# 返回: 0=无更新, 3=updater已更新, 4=installer已更新, 1=失败
+# 功能: 检查脚本更新
 check_scripts_update() {
     log "[检查] 脚本更新"
     
@@ -182,9 +168,7 @@ check_scripts_update() {
     return 0
 }
 
-# 功能: 智能匹配并筛选相关文件
-# 参数: $1=所有文件列表(换行分隔), $2=包名
-# 输出: 匹配的文件列表(换行分隔)
+# 功能: 智能筛选相关文件
 filter_related_files() {
     local all_files="$1"
     local package_name="$2"
@@ -201,19 +185,13 @@ filter_related_files() {
         
         local should_include=0
         
-        # 1. 主程序文件 (精确匹配包名)
         if echo "$filename" | grep -qiE "^${package_name}[_\.-]"; then
             should_include=1
             log "      [主程序] $filename"
-        
-        # 2. 语言包 (luci-i18n-xxx-zh-cn)
         elif echo "$filename" | grep -qiE "^luci-i18n-${app_name}.*zh-cn"; then
             should_include=1
             log "      [语言包] $filename"
-        
-        # 3. 架构包 (包名去掉 luci-app- 或 luci-theme- 前缀)
         elif echo "$filename" | grep -qiE "^${app_name}[_\.-]"; then
-            # 排除语言包误判
             if ! echo "$filename" | grep -qi "i18n"; then
                 should_include=1
                 log "      [架构包] $filename"
@@ -227,13 +205,10 @@ filter_related_files() {
     
     IFS="$old_IFS"
     
-    # 去除末尾的 \n
     echo -e "$matched_files" | grep -v "^$"
 }
 
-# 功能: 批量安装包文件（按依赖顺序）
-# 参数: $1=包文件路径列表（换行分隔）
-# 返回: 0=全部成功, 1=有失败
+# 功能: 批量安装包文件
 install_package_batch() {
     local pkg_files="$1"
     
@@ -247,14 +222,12 @@ install_package_batch() {
     local old_IFS="$IFS"
     IFS=$'\n'
     
-    # 分类文件
     for pkg_file in $pkg_files; do
         [ -z "$pkg_file" ] || [ ! -f "$pkg_file" ] && continue
         
         local filename=$(basename "$pkg_file")
         local size=$(stat -c%s "$pkg_file" 2>/dev/null || echo 0)
         
-        # 按文件名和大小分类
         if echo "$filename" | grep -qiE "luci-i18n.*zh-cn"; then
             lang_pkgs="${lang_pkgs}${pkg_file}\n"
         elif echo "$filename" | grep -qiE "^luci-(app|theme)-"; then
@@ -262,17 +235,14 @@ install_package_batch() {
         elif echo "$filename" | grep -qiE "[_-](all|noarch)\."; then
             all_pkgs="${all_pkgs}${pkg_file}\n"
         elif [ "$size" -gt 5242880 ]; then
-            # 大于 5MB 视为架构包（包含依赖）
             arch_pkgs="${arch_pkgs}${pkg_file}\n"
         else
-            # 其他架构包
             arch_pkgs="${arch_pkgs}${pkg_file}\n"
         fi
     done
     
     IFS="$old_IFS"
     
-    # 定义安装批次（按依赖顺序）
     local batches="
 1|架构依赖包|$arch_pkgs
 2|主程序|$main_pkgs
@@ -296,7 +266,6 @@ install_package_batch() {
             
             local pkg_name=$(basename "$pkg_file" | sed 's/_.*\.\(ipk\|apk\)$//')
             
-            # 检查是否已安装
             if is_installed "$pkg_name"; then
                 log "    跳过已安装: $pkg_name"
                 total_skip=$((total_skip + 1))
@@ -305,7 +274,8 @@ install_package_batch() {
             
             log "    安装: $pkg_name"
             
-            if $PKG_INSTALL "$pkg_file" >>"${LOG_FILE:-/dev/null}" 2>&1; then
+            # 直接调用，输出自动进入父进程日志
+            if $PKG_INSTALL "$pkg_file"; then
                 log "    成功"
                 total_ok=$((total_ok + 1))
             else
@@ -323,8 +293,6 @@ install_package_batch() {
 }
 
 # 功能: 安装或更新第三方包
-# 参数: $1=包名, $2=模式(install/update), $3=当前版本(仅update模式)
-# 返回: 0=成功, 2=已是最新, 1=失败
 install_third_party_package() {
     local package_name="$1"
     local mode="${2:-install}"
@@ -333,7 +301,6 @@ install_third_party_package() {
     log "[$([ "$mode" = "update" ] && echo "更新" || echo "安装")] $package_name"
     [ "$mode" = "update" ] && log "  当前版本: $current_version"
     
-    # 获取仓库元数据
     local metadata=$(get_repo_metadata)
     
     if [ -z "$metadata" ]; then
@@ -341,7 +308,6 @@ install_third_party_package() {
         return 1
     fi
     
-    # 检查包目录是否存在
     local package_dirs=""
     if which jsonfilter >/dev/null 2>&1; then
         package_dirs=$(echo "$metadata" | jsonfilter -e '@[@.type="dir"].name' 2>/dev/null)
@@ -356,7 +322,6 @@ install_third_party_package() {
     
     log "  包目录存在，查询版本..."
     
-    # 遍历所有源
     for source_config in $API_SOURCES; do
         local platform=$(echo "$source_config" | cut -d'|' -f1)
         local repo=$(echo "$source_config" | cut -d'|' -f2)
@@ -364,7 +329,6 @@ install_third_party_package() {
         
         log "  [源] $platform"
         
-        # 查询版本列表
         local versions_json=$(api_get_contents "$platform" "$repo" "$package_name" "$branch")
         
         if [ -z "$versions_json" ]; then
@@ -388,7 +352,6 @@ install_third_party_package() {
         local latest_version=$(echo "$versions" | head -1)
         log "    最新版本: $latest_version"
         
-        # 版本比对（仅更新模式）
         if [ "$mode" = "update" ]; then
             local cur_norm=$(normalize_version "$current_version")
             local new_norm=$(normalize_version "$latest_version")
@@ -399,7 +362,6 @@ install_third_party_package() {
             fi
         fi
         
-        # 查询文件列表
         local files_json=$(api_get_contents "$platform" "$repo" "$package_name/$latest_version" "$branch")
         
         if [ -z "$files_json" ]; then
@@ -407,7 +369,6 @@ install_third_party_package() {
             continue
         fi
         
-        # 提取所有 ipk/apk 文件
         local all_files=""
         if which jsonfilter >/dev/null 2>&1; then
             all_files=$(echo "$files_json" | jsonfilter -e '@[@.type="file"].name' 2>/dev/null | \
@@ -424,7 +385,6 @@ install_third_party_package() {
         log "    可用文件 (共 $(echo "$all_files" | wc -l) 个):"
         echo "$all_files" | while read f; do log "      $f"; done
         
-        # 智能筛选相关文件
         log "    筛选相关文件:"
         local matched_files=$(filter_related_files "$all_files" "$package_name")
         
@@ -436,7 +396,6 @@ install_third_party_package() {
         log "    匹配结果 (共 $(echo "$matched_files" | wc -l) 个):"
         echo "$matched_files" | while read f; do log "      $f"; done
         
-        # 下载所有匹配的文件
         log "    开始下载..."
         local temp_dir="/tmp/third_party_${package_name}_$$"
         mkdir -p "$temp_dir"
@@ -479,7 +438,6 @@ install_third_party_package() {
         
         IFS="$old_IFS"
         
-        # 如果下载失败，清理并尝试下一个源
         if [ $download_failed -eq 1 ]; then
             rm -rf "$temp_dir"
             log "    下载失败，尝试下一个源..."
@@ -487,8 +445,6 @@ install_third_party_package() {
         fi
         
         log "    所有文件下载完成"
-        
-        # 批量安装
         log "    开始安装..."
         
         if install_package_batch "$(echo -e "$downloaded_files")"; then
@@ -521,13 +477,8 @@ usage() {
   --check-script-update       - 检查脚本更新
 
 示例:
-  # 首次安装
   $0 install luci-app-openclash
-
-  # 检查更新
   $0 update luci-app-openclash v1.2.3
-
-  # 检查脚本更新
   $0 --check-script-update
 
 返回码:
