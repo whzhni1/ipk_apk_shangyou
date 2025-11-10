@@ -28,8 +28,6 @@ for var in $EMPTY_VARS; do
     eval "$var=''"
 done
 
-exec >> "$LOG_FILE" 2>&1
-
 # 功能: 日志输出
 # 参数: $1=消息内容
 log() {
@@ -599,6 +597,7 @@ remove_self() {
 
 # 功能: 主安装流程
 run_setup() {
+    exec >> "$LOG_FILE" 2>&1
     log "[开始] 自动配置 (PID: $$)"
     log "日志文件: $LOG_FILE"
     
