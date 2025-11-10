@@ -20,8 +20,6 @@ done
 
 CONFIG_BACKED_UP=0
 
-exec >> "$LOG_FILE" 2>&1
-
 # 功能: 日志输出
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
@@ -507,9 +505,8 @@ generate_report() {
 
 # 功能: 主更新流程
 run_update() {
-    rm -f "$LOG_FILE"
-    touch "$LOG_FILE"
-    
+    : > "$LOG_FILE"  # 清空日志
+    exec >> "$LOG_FILE" 2>&1
     log "OpenWrt 自动更新 v${SCRIPT_VERSION}"
     log "开始执行 (PID: $$)"
     log "日志文件: $LOG_FILE"
