@@ -1,39 +1,146 @@
-name: 同步到镜像仓库
+name: 同步仓库和镜像
 
 on:
-  workflow_dispatch:
-  workflow_run:
+  workflow_dispatch:  # 手动触发
+  push:               # 工具文件改动触发
+    branches:
+      - main
+    paths:
+      - 'auto-update.sh'
+      - 'auto-setup'
+      - 'third-party-installer.sh'
+  workflow_run:       # 主工作流完成触发
     workflows: ["同步上游发布版本"]
     types:
       - completed
-  schedule:
+  schedule:           # 定时同步
     - cron: '30 19 * * *'
 
 env:
-  BRANCH: main
-  GITEE_USERNAME: whzhni       # Gitee 用户名
-  GITCODE_USERNAME: whzhni     # GitCode 用户名
+  SOURCE_REPO: whzhni1/ipk_apk    # GitHub 源仓库
+  GITEE_USERNAME: whzhni          # Gitee 用户名
+  GITCODE_USERNAME: whzhni        # GitCode 用户名
   REPO: ipk_apk
-  SOURCE_REPO: whzhni1/ipk_apk # GitHub 源仓库
+  BRANCH: main
+  FILES_TO_SYNC: 'auto-update.sh auto-setup third-party-installer.sh'
 
 jobs:
-  sync-gitee:
+  # ========================================
+  # 阶段1: 同步文件到 GitHub（仅 push 触发）
+  # ========================================
+  sync-files-to-github:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.workflow_run.conclusion == 'success' }}
+    if: github.event_name == 'push'  # 只在 push 时执行
+    outputs:
+      files_changed: ${{ steps.sync.outputs.files_changed }}
+    
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: source
+
+      - name: 检出目标仓库
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+          path: target
+
+      - name: 配置 Git
+        run: |
+          cd target
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 同步文件
+        id: sync
+        run: |
+          cd target
+          
+          echo "========================================="
+          echo "📋 同步文件到 ${{ env.SOURCE_REPO }}"
+          echo "========================================="
+          
+          FILES_CHANGED=false
+          CHANGED_FILES=""
+          
+          for file in ${{ env.FILES_TO_SYNC }}; do
+            if [ -f "../source/$file" ]; then
+              cp "../source/$file" "./$file"
+              
+              if git diff --quiet "$file"; then
+                echo "⏭️  $file (无变化)"
+              else
+                echo "✅ $file (已更新)"
+                FILES_CHANGED=true
+                CHANGED_FILES="$CHANGED_FILES $file"
+              fi
+            else
+              echo "⚠️  $file (源文件不存在)"
+            fi
+          done
+          
+          echo ""
+          echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
+          
+          if [ "$FILES_CHANGED" = "true" ]; then
+            echo "📝 变更文件:$CHANGED_FILES"
+            
+            git add ${{ env.FILES_TO_SYNC }}
+            
+            git commit -m "🔄 同步工具脚本更新
+
+变更文件:$CHANGED_FILES
+
+- 来源: ${{ github.repository }}
+- 提交: ${{ github.sha }}
+- 时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
+            
+            echo "🚀 推送到 ${{ env.SOURCE_REPO }}..."
+            git push
+            
+            echo "✅ GitHub 同步完成"
+          else
+            echo "ℹ️  无文件变更，跳过推送"
+          fi
+
+  # ========================================
+  # 阶段2: 同步到 Gitee
+  # ========================================
+  sync-to-gitee:
+    runs-on: ubuntu-latest
+    needs: [sync-files-to-github]
+    if: |
+      always() && 
+      !contains(needs.*.result, 'failure') && 
+      !contains(needs.*.result, 'cancelled') &&
+      (github.event_name == 'workflow_dispatch' || 
+       github.event_name == 'schedule' || 
+       github.event_name == 'push' ||
+       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
     outputs:
       status: ${{ steps.sync.outcome }}
       duration: ${{ steps.sync.outputs.duration }}
       configured: ${{ steps.sync.outputs.configured }}
     
     steps:
-      - name: 检出源仓库代码
+      - name: 等待 GitHub 同步完成
+        if: github.event_name == 'push'
+        run: |
+          echo "⏳ 等待5秒确保 GitHub 同步完成..."
+          sleep 5
+
+      - name: 检出源仓库
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
 
-      - name: 设置 Git 配置
+      - name: 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -46,6 +153,7 @@ jobs:
           START_TIME=$(date +%s)
           
           if [ -z "$GITEE_TOKEN" ]; then
+            echo "⚠️ GITEE_TOKEN 未设置"
             echo "configured=未设置" >> $GITHUB_OUTPUT
             echo "duration=0" >> $GITHUB_OUTPUT
             exit 0
@@ -55,14 +163,12 @@ jobs:
           
           echo "========================================="
           echo "📋 源仓库: ${{ env.SOURCE_REPO }}"
-          echo "🎯 目标仓库: https://gitee.com/${{ env.GITEE_USERNAME }}/${{ env.REPO }}"
+          echo "🎯 目标: https://gitee.com/${{ env.GITEE_USERNAME }}/${{ env.REPO }}"
           echo "========================================="
           
-          # 添加或更新远程仓库
           git remote add gitee https://oauth2:${GITEE_TOKEN}@gitee.com/${{ env.GITEE_USERNAME }}/${{ env.REPO }}.git 2>/dev/null || \
           git remote set-url gitee https://oauth2:${GITEE_TOKEN}@gitee.com/${{ env.GITEE_USERNAME }}/${{ env.REPO }}.git
           
-          # 推送到 Gitee
           echo "🚀 开始推送..."
           git push gitee +${{ env.BRANCH }}:${{ env.BRANCH }}
           
@@ -72,23 +178,40 @@ jobs:
           
           echo "✅ Gitee 同步完成 (耗时 ${DURATION}s)"
 
-  sync-gitcode:
+  # ========================================
+  # 阶段3: 同步到 GitCode
+  # ========================================
+  sync-to-gitcode:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.workflow_run.conclusion == 'success' }}
+    needs: [sync-files-to-github]
+    if: |
+      always() && 
+      !contains(needs.*.result, 'failure') && 
+      !contains(needs.*.result, 'cancelled') &&
+      (github.event_name == 'workflow_dispatch' || 
+       github.event_name == 'schedule' || 
+       github.event_name == 'push' ||
+       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
     outputs:
       status: ${{ steps.sync.outcome }}
       duration: ${{ steps.sync.outputs.duration }}
       configured: ${{ steps.sync.outputs.configured }}
     
     steps:
-      - name: 检出源仓库代码
+      - name: 等待 GitHub 同步完成
+        if: github.event_name == 'push'
+        run: |
+          echo "⏳ 等待5秒确保 GitHub 同步完成..."
+          sleep 5
+
+      - name: 检出源仓库
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
 
-      - name: 设置 Git 配置
+      - name: 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -101,6 +224,7 @@ jobs:
           START_TIME=$(date +%s)
           
           if [ -z "$GITCODE_TOKEN" ]; then
+            echo "⚠️ GITCODE_TOKEN 未设置"
             echo "configured=未设置" >> $GITHUB_OUTPUT
             echo "duration=0" >> $GITHUB_OUTPUT
             exit 0
@@ -110,14 +234,12 @@ jobs:
           
           echo "========================================="
           echo "📋 源仓库: ${{ env.SOURCE_REPO }}"
-          echo "🎯 目标仓库: https://gitcode.com/${{ env.GITCODE_USERNAME }}/${{ env.REPO }}"
+          echo "🎯 目标: https://gitcode.com/${{ env.GITCODE_USERNAME }}/${{ env.REPO }}"
           echo "========================================="
           
-          # 添加或更新远程仓库
           git remote add gitcode https://oauth2:${GITCODE_TOKEN}@gitcode.com/${{ env.GITCODE_USERNAME }}/${{ env.REPO }}.git 2>/dev/null || \
           git remote set-url gitcode https://oauth2:${GITCODE_TOKEN}@gitcode.com/${{ env.GITCODE_USERNAME }}/${{ env.REPO }}.git
           
-          # 推送到 GitCode
           echo "🚀 开始推送..."
           git push gitcode +${{ env.BRANCH }}:${{ env.BRANCH }}
           
@@ -127,46 +249,81 @@ jobs:
           
           echo "✅ GitCode 同步完成 (耗时 ${DURATION}s)"
 
+  # ========================================
+  # 阶段4: 生成报告
+  # ========================================
   report:
     runs-on: ubuntu-latest
-    needs: [sync-gitee, sync-gitcode]
+    needs: [sync-files-to-github, sync-to-gitee, sync-to-gitcode]
     if: always()
     
     steps:
       - name: 生成同步报告
         run: |
-          # 获取数据
-          GITEE_STATUS="${{ needs.sync-gitee.result }}"
-          GITCODE_STATUS="${{ needs.sync-gitcode.result }}"
-          GITEE_CONFIGURED="${{ needs.sync-gitee.outputs.configured }}"
-          GITCODE_CONFIGURED="${{ needs.sync-gitcode.outputs.configured }}"
-          GITEE_DURATION="${{ needs.sync-gitee.outputs.duration }}"
-          GITCODE_DURATION="${{ needs.sync-gitcode.outputs.duration }}"
+          # 获取各阶段状态
+          GITHUB_SYNC_STATUS="${{ needs.sync-files-to-github.result }}"
+          FILES_CHANGED="${{ needs.sync-files-to-github.outputs.files_changed }}"
+          GITEE_STATUS="${{ needs.sync-to-gitee.result }}"
+          GITCODE_STATUS="${{ needs.sync-to-gitcode.result }}"
+          GITEE_CONFIGURED="${{ needs.sync-to-gitee.outputs.configured }}"
+          GITCODE_CONFIGURED="${{ needs.sync-to-gitcode.outputs.configured }}"
+          GITEE_DURATION="${{ needs.sync-to-gitee.outputs.duration }}"
+          GITCODE_DURATION="${{ needs.sync-to-gitcode.outputs.duration }}"
           
           # 设置默认值
           GITEE_DURATION=${GITEE_DURATION:-0}
           GITCODE_DURATION=${GITCODE_DURATION:-0}
           GITEE_CONFIGURED=${GITEE_CONFIGURED:-未设置}
           GITCODE_CONFIGURED=${GITCODE_CONFIGURED:-未设置}
+          FILES_CHANGED=${FILES_CHANGED:-false}
           
-          # 判断状态
+          # 判断 GitHub 同步状态
+          if [ "${{ github.event_name }}" == "push" ]; then
+            if [ "$GITHUB_SYNC_STATUS" == "success" ]; then
+              if [ "$FILES_CHANGED" == "true" ]; then
+                GITHUB_ICON="✅"
+                GITHUB_TEXT="已更新"
+              else
+                GITHUB_ICON="ℹ️"
+                GITHUB_TEXT="无变更"
+              fi
+            elif [ "$GITHUB_SYNC_STATUS" == "skipped" ]; then
+              GITHUB_ICON="⏭️"
+              GITHUB_TEXT="跳过"
+            else
+              GITHUB_ICON="❌"
+              GITHUB_TEXT="失败"
+            fi
+          else
+            GITHUB_ICON="➖"
+            GITHUB_TEXT="未执行"
+          fi
+          
+          # 判断 Gitee 状态
           if [ "$GITEE_CONFIGURED" == "未设置" ]; then
             GITEE_ICON="⚙️"
             GITEE_TEXT="未配置"
           elif [ "$GITEE_STATUS" == "success" ]; then
             GITEE_ICON="✅"
             GITEE_TEXT="成功"
+          elif [ "$GITEE_STATUS" == "skipped" ]; then
+            GITEE_ICON="⏭️"
+            GITEE_TEXT="跳过"
           else
             GITEE_ICON="❌"
             GITEE_TEXT="失败"
           fi
           
+          # 判断 GitCode 状态
           if [ "$GITCODE_CONFIGURED" == "未设置" ]; then
             GITCODE_ICON="⚙️"
             GITCODE_TEXT="未配置"
           elif [ "$GITCODE_STATUS" == "success" ]; then
             GITCODE_ICON="✅"
             GITCODE_TEXT="成功"
+          elif [ "$GITCODE_STATUS" == "skipped" ]; then
+            GITCODE_ICON="⏭️"
+            GITCODE_TEXT="跳过"
           else
             GITCODE_ICON="❌"
             GITCODE_TEXT="失败"
@@ -177,15 +334,16 @@ jobs:
             TRIGGER="主工作流完成"
           elif [ "${{ github.event_name }}" == "schedule" ]; then
             TRIGGER="定时任务"
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            TRIGGER="文件改动"
           else
             TRIGGER="手动触发"
           fi
           
-          # 生成 Summary
+          # 生成报告
           cat >> $GITHUB_STEP_SUMMARY << EOF
-          # 🔄 镜像同步报告
+          # 🔄 同步报告
           
-          **源仓库**: [${{ env.SOURCE_REPO }}](https://github.com/${{ env.SOURCE_REPO }})  
           **触发方式**: $TRIGGER  
           **触发时间**: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)  
           **分支**: \`${{ env.BRANCH }}\`
@@ -194,14 +352,15 @@ jobs:
           
           ### 📋 同步结果
           
-          | 同步目标 | 同步状态 | 同步用时 | Token状态 |
+          | 同步目标 | 同步状态 | 同步用时 | 配置状态 |
           |---------|---------|---------|----------|
+          | GitHub 源仓库 | $GITHUB_ICON $GITHUB_TEXT | - | - |
           | Gitee | $GITEE_ICON $GITEE_TEXT | ${GITEE_DURATION}s | $GITEE_CONFIGURED |
           | GitCode | $GITCODE_ICON $GITCODE_TEXT | ${GITCODE_DURATION}s | $GITCODE_CONFIGURED |
           
           ---
           
-          ### 🌐 镜像仓库地址
+          ### 🌐 仓库地址
           
           - 🐙 **GitHub**: https://github.com/${{ env.SOURCE_REPO }}
           - 🟠 **Gitee**: https://gitee.com/${{ env.GITEE_USERNAME }}/${{ env.REPO }}
@@ -209,15 +368,34 @@ jobs:
           
           ---
           
-          ### 📌 配置说明
+          ### 📁 同步文件列表
           
-          $(if [ "$GITEE_CONFIGURED" == "未设置" ]; then
-            echo "- ⚙️ **Gitee**: 需在仓库 Settings → Secrets 中添加 \`GITEE_TOKEN\`"
-          fi)
-          $(if [ "$GITCODE_CONFIGURED" == "未设置" ]; then
-            echo "- ⚙️ **GitCode**: 需在仓库 Settings → Secrets 中添加 \`GITCODE_TOKEN\`"
-          fi)
           EOF
           
+          # 显示同步的文件
+          if [ "${{ github.event_name }}" == "push" ]; then
+            for file in ${{ env.FILES_TO_SYNC }}; do
+              echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "_本次触发不涉及文件同步_" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # 添加配置提示
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$GITEE_CONFIGURED" == "未设置" ] || [ "$GITCODE_CONFIGURED" == "未设置" ]; then
+            echo "### ⚙️ 配置提示" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ "$GITEE_CONFIGURED" == "未设置" ]; then
+              echo "- **Gitee**: 需在仓库 Settings → Secrets 中添加 \`GITEE_TOKEN\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            if [ "$GITCODE_CONFIGURED" == "未设置" ]; then
+              echo "- **GitCode**: 需在仓库 Settings → Secrets 中添加 \`GITCODE_TOKEN\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
           # Annotation
-          echo "::notice title=镜像同步报告::源: ${{ env.SOURCE_REPO }} | 触发: $TRIGGER | Gitee: $GITEE_ICON $GITEE_TEXT (${GITEE_DURATION}s) | GitCode: $GITCODE_ICON $GITCODE_TEXT (${GITCODE_DURATION}s)"
+          echo "::notice title=同步报告::触发: $TRIGGER | GitHub: $GITHUB_ICON | Gitee: $GITEE_ICON (${GITEE_DURATION}s) | GitCode: $GITCODE_ICON (${GITCODE_DURATION}s)"
