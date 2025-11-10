@@ -3,7 +3,7 @@
 START=99
 STOP=01
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.1.1"
 
 # 软件包列表
 PACKAGES="luci-app-wechatpush luci-app-passwall2 luci-app-openclash luci-app-filemanager luci-i18n-package-manager-zh-cn luci-i18n-firewall-zh-cn vsftpd openssh-sftp-server luci-app-ttyd lucky luci-app-tailscale luci-theme-aurora"
