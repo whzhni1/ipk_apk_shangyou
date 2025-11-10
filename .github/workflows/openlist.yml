@@ -273,18 +273,18 @@ jobs:
           if [ "$CURRENT_VERSION" = "none" ]; then
             COMMIT_MSG="🚀 添加 OpenList2 $LATEST_VERSION
 
-- 新增版本: $LATEST_VERSION
-- 软件包数: $FILE_COUNT
-- 上游仓库: ${{ env.SOURCE_REPO }}
-- 构建时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
+          - 新增版本: $LATEST_VERSION
+          - 软件包数: $FILE_COUNT
+          - 上游仓库: ${{ env.SOURCE_REPO }}
+          - 构建时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
           else
             COMMIT_MSG="🔄 更新 OpenList2 到 $LATEST_VERSION
 
-- 旧版本: $CURRENT_VERSION
-- 新版本: $LATEST_VERSION
-- 软件包数: $FILE_COUNT
-- 上游仓库: ${{ env.SOURCE_REPO }}
-- 更新时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
+          - 旧版本: $CURRENT_VERSION
+          - 新版本: $LATEST_VERSION
+          - 软件包数: $FILE_COUNT
+          - 上游仓库: ${{ env.SOURCE_REPO }}
+          - 更新时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
           fi
           
           git commit -m "$COMMIT_MSG"
