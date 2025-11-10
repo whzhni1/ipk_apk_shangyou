@@ -34,6 +34,8 @@ jobs:
     outputs:
       files_changed: ${{ steps.sync.outputs.files_changed }}
       changed_list: ${{ steps.sync.outputs.changed_list }}
+      duration: ${{ steps.sync.outputs.duration }}
+      configured: ${{ steps.sync.outputs.configured }}
     
     steps:
       - name: 检出本仓库
@@ -58,7 +60,22 @@ jobs:
 
       - name: 同步文件
         id: sync
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
+          START_TIME=$(date +%s)
+          
+          # 检查 PAT_TOKEN 配置
+          if [ -z "$PAT_TOKEN" ]; then
+            echo "❌ PAT_TOKEN 未设置"
+            echo "configured=未设置" >> $GITHUB_OUTPUT
+            echo "duration=0" >> $GITHUB_OUTPUT
+            echo "files_changed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "configured=已设置" >> $GITHUB_OUTPUT
+          
           echo "========================================="
           echo "📋 同步文件到 ${{ env.SOURCE_REPO }}"
           echo "========================================="
@@ -106,14 +123,17 @@ jobs:
           echo ""
           echo "🔍 检查变更..."
           
-          # 检查是否有变更（包括新文件和修改的文件）
+          # 检查是否有变更
           git add ${{ env.FILES_TO_SYNC }} 2>/dev/null || true
           
-          # 使用 git diff --cached 检查暂存区的变化
           if git diff --cached --quiet; then
             echo "ℹ️  没有检测到文件变更"
             echo "files_changed=false" >> $GITHUB_OUTPUT
             echo "changed_list=" >> $GITHUB_OUTPUT
+            
+            END_TIME=$(date +%s)
+            DURATION=$((END_TIME - START_TIME))
+            echo "duration=$DURATION" >> $GITHUB_OUTPUT
           else
             echo "✅ 检测到文件变更"
             
@@ -168,6 +188,10 @@ jobs:
               echo "❌ 推送失败"
               exit 1
             fi
+            
+            END_TIME=$(date +%s)
+            DURATION=$((END_TIME - START_TIME))
+            echo "duration=$DURATION" >> $GITHUB_OUTPUT
           fi
           
           echo ""
@@ -331,6 +355,8 @@ jobs:
           GITHUB_SYNC_STATUS="${{ needs.sync-files-to-github.result }}"
           FILES_CHANGED="${{ needs.sync-files-to-github.outputs.files_changed }}"
           CHANGED_LIST="${{ needs.sync-files-to-github.outputs.changed_list }}"
+          GITHUB_DURATION="${{ needs.sync-files-to-github.outputs.duration }}"
+          GITHUB_CONFIGURED="${{ needs.sync-files-to-github.outputs.configured }}"
           GITEE_STATUS="${{ needs.sync-to-gitee.result }}"
           GITCODE_STATUS="${{ needs.sync-to-gitcode.result }}"
           GITEE_CONFIGURED="${{ needs.sync-to-gitee.outputs.configured }}"
@@ -338,8 +364,11 @@ jobs:
           GITEE_DURATION="${{ needs.sync-to-gitee.outputs.duration }}"
           GITCODE_DURATION="${{ needs.sync-to-gitcode.outputs.duration }}"
           
+          # 设置默认值
+          GITHUB_DURATION=${GITHUB_DURATION:-0}
           GITEE_DURATION=${GITEE_DURATION:-0}
           GITCODE_DURATION=${GITCODE_DURATION:-0}
+          GITHUB_CONFIGURED=${GITHUB_CONFIGURED:-未设置}
           GITEE_CONFIGURED=${GITEE_CONFIGURED:-未设置}
           GITCODE_CONFIGURED=${GITCODE_CONFIGURED:-未设置}
           FILES_CHANGED=${FILES_CHANGED:-false}
@@ -357,13 +386,18 @@ jobs:
             elif [ "$GITHUB_SYNC_STATUS" == "skipped" ]; then
               GITHUB_ICON="⏭️"
               GITHUB_TEXT="跳过"
-            else
+            elif [ "$GITHUB_SYNC_STATUS" == "failure" ]; then
               GITHUB_ICON="❌"
               GITHUB_TEXT="失败"
+            else
+              GITHUB_ICON="❓"
+              GITHUB_TEXT="未知"
             fi
           else
             GITHUB_ICON="➖"
             GITHUB_TEXT="未执行"
+            GITHUB_DURATION="-"
+            GITHUB_CONFIGURED="-"
           fi
           
           # 判断 Gitee 状态
@@ -421,9 +455,9 @@ jobs:
           
           | 同步目标 | 同步状态 | 同步用时 | 配置状态 |
           |---------|---------|---------|----------|
-          | GitHub 源仓库 | $GITHUB_ICON $GITHUB_TEXT | - | - |
-          | Gitee | $GITEE_ICON $GITEE_TEXT | ${GITEE_DURATION}s | $GITEE_CONFIGURED |
-          | GitCode | $GITCODE_ICON $GITCODE_TEXT | ${GITCODE_DURATION}s | $GITCODE_CONFIGURED |
+          | GitHub 源仓库 | $GITHUB_ICON $GITHUB_TEXT | ${GITHUB_DURATION}s | $GITHUB_CONFIGURED |
+          | Gitee 镜像 | $GITEE_ICON $GITEE_TEXT | ${GITEE_DURATION}s | $GITEE_CONFIGURED |
+          | GitCode 镜像 | $GITCODE_ICON $GITCODE_TEXT | ${GITCODE_DURATION}s | $GITCODE_CONFIGURED |
           
           ---
           
@@ -446,6 +480,12 @@ jobs:
               echo '```' >> $GITHUB_STEP_SUMMARY
               echo "$CHANGED_LIST" >> $GITHUB_STEP_SUMMARY
               echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**所有监控文件：**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              for file in ${{ env.FILES_TO_SYNC }}; do
+                echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
+              done
             else
               echo "**监控文件：**" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
@@ -457,5 +497,23 @@ jobs:
             echo "_本次触发不涉及文件同步_" >> $GITHUB_STEP_SUMMARY
           fi
           
+          # 配置提示
+          if [ "$GITHUB_CONFIGURED" == "未设置" ] || [ "$GITEE_CONFIGURED" == "未设置" ] || [ "$GITCODE_CONFIGURED" == "未设置" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ⚙️ 配置提示" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ "$GITHUB_CONFIGURED" == "未设置" ]; then
+              echo "- **GitHub**: 需在仓库 Settings → Secrets 中添加 \`PAT_TOKEN\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            if [ "$GITEE_CONFIGURED" == "未设置" ]; then
+              echo "- **Gitee**: 需在仓库 Settings → Secrets 中添加 \`GITEE_TOKEN\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            if [ "$GITCODE_CONFIGURED" == "未设置" ]; then
+              echo "- **GitCode**: 需在仓库 Settings → Secrets 中添加 \`GITCODE_TOKEN\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
           # Annotation
-          echo "::notice title=同步报告::触发: $TRIGGER | GitHub: $GITHUB_ICON | Gitee: $GITEE_ICON (${GITEE_DURATION}s) | GitCode: $GITCODE_ICON (${GITCODE_DURATION}s)"
+          echo "::notice title=同步报告::触发: $TRIGGER | GitHub: $GITHUB_ICON (${GITHUB_DURATION}s) | Gitee: $GITEE_ICON (${GITEE_DURATION}s) | GitCode: $GITCODE_ICON (${GITCODE_DURATION}s)"
