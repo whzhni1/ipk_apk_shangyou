@@ -249,45 +249,28 @@ jobs:
           echo "版本: $LATEST_VERSION"
           echo ""
           
-          # 创建目标目录
           mkdir -p "${{ env.TARGET_DIR }}/$LATEST_VERSION"
           
-          # 统计变量
           IPK_COUNT=0
           APK_COUNT=0
           
-          # 用于跟踪架构无关的包（避免重复）
-          declare -A processed_files
-          
-          # 遍历所有 artifact
           for artifact_dir in artifacts/packages-*/; do
             if [ ! -d "$artifact_dir" ]; then
               continue
             fi
             
             artifact_name=$(basename "$artifact_dir")
-            
-            # 从 artifact 名称提取架构和 SDK
             arch=$(echo "$artifact_name" | sed 's/^packages-//' | sed 's/-openwrt-24.10$//' | sed 's/-SNAPSHOT$//')
-            sdk=$(echo "$artifact_name" | grep -oE '(openwrt-24\.10|SNAPSHOT)$')
             
-            echo "📁 处理: $artifact_name (架构: $arch, SDK: $sdk)"
+            echo "📁 处理: $artifact_name (架构: $arch)"
             
-            # 处理 IPK 文件
+            # 处理 IPK
             while IFS= read -r file; do
               if [ -f "$file" ]; then
                 filename=$(basename "$file")
                 
-                # 检查是否为架构无关的包
-                if [[ "$filename" == *"_all.ipk" ]]; then
-                  if [ -z "${processed_files[$filename]}" ]; then
-                    cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
-                    echo "   ✅ IPK (通用): $filename"
-                    processed_files[$filename]=1
-                    IPK_COUNT=$((IPK_COUNT + 1))
-                  else
-                    echo "   ⏭️  IPK (跳过): $filename"
-                  fi
+                if [[ "$filename" == *"_all.ipk" ]] && [ -f "${{ env.TARGET_DIR }}/$LATEST_VERSION/$filename" ]; then
+                  echo "   ⏭️  IPK (跳过): $filename"
                 else
                   cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
                   echo "   ✅ IPK: $filename"
@@ -296,20 +279,15 @@ jobs:
               fi
             done < <(find "$artifact_dir" -type f -name "*.ipk")
             
-            # 处理 APK 文件
+            # 处理 APK
             while IFS= read -r file; do
               if [ -f "$file" ]; then
                 original_filename=$(basename "$file")
                 
-                # 检查是否为架构无关的包
                 if [[ "$original_filename" == luci-* ]]; then
-                  unique_key="${original_filename}_${sdk}"
-                  
-                  if [ -z "${processed_files[$unique_key]}" ]; then
-                    new_filename="${original_filename%.apk}_${sdk}.apk"
-                    cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/$new_filename"
-                    echo "   ✅ APK (通用): $new_filename"
-                    processed_files[$unique_key]=1
+                  if [ ! -f "${{ env.TARGET_DIR }}/$LATEST_VERSION/$original_filename" ]; then
+                    cp "$file" "${{ env.TARGET_DIR }}/$LATEST_VERSION/"
+                    echo "   ✅ APK (通用): $original_filename"
                     APK_COUNT=$((APK_COUNT + 1))
                   else
                     echo "   ⏭️  APK (跳过): $original_filename"
@@ -328,7 +306,6 @@ jobs:
             echo ""
           done
           
-          # 统计最终结果
           FINAL_IPK=$(find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -type f -name "*.ipk" 2>/dev/null | wc -l)
           FINAL_APK=$(find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -type f -name "*.apk" 2>/dev/null | wc -l)
           TOTAL_FILES=$((FINAL_IPK + FINAL_APK))
@@ -336,34 +313,18 @@ jobs:
           echo "========================================="
           echo "📊 文件统计"
           echo "========================================="
-          echo "复制过程统计:"
-          echo "  IPK: $IPK_COUNT 个"
-          echo "  APK: $APK_COUNT 个"
-          echo ""
-          echo "最终目录统计:"
-          echo "  IPK: $FINAL_IPK 个"
-          echo "  APK: $FINAL_APK 个"
-          echo "  总计: $TOTAL_FILES 个"
+          echo "复制过程: IPK $IPK_COUNT 个, APK $APK_COUNT 个"
+          echo "最终结果: IPK $FINAL_IPK 个, APK $FINAL_APK 个, 总计 $TOTAL_FILES 个"
           echo ""
           
-          # 删除旧版本
           if [ "$CURRENT_VERSION" != "none" ] && [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
             echo "🗑️  删除旧版本: $CURRENT_VERSION"
             rm -rf "${{ env.TARGET_DIR }}/$CURRENT_VERSION"
-            echo ""
           fi
           
-          # 按类型显示文件
-          echo "========================================="
-          echo "📁 IPK 文件列表（前10个）"
-          echo "========================================="
-          find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -name "*.ipk" | head -10 | xargs -I {} basename {}
-          
           echo ""
-          echo "========================================="
-          echo "📁 APK 文件列表（前10个）"
-          echo "========================================="
-          find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -name "*.apk" | head -10 | xargs -I {} basename {}
+          echo "📁 APK 文件示例（前20个）:"
+          find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -name "*.apk" | head -20 | xargs -r -I {} basename {}
           
           echo ""
           echo "✅ 整理完成"
@@ -380,12 +341,10 @@ jobs:
             exit 0
           fi
           
-          # 统计文件
           IPK_COUNT=$(find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -type f -name "*.ipk" 2>/dev/null | wc -l)
           APK_COUNT=$(find "${{ env.TARGET_DIR }}/$LATEST_VERSION" -type f -name "*.apk" 2>/dev/null | wc -l)
           TOTAL_COUNT=$((IPK_COUNT + APK_COUNT))
           
-          # 生成提交信息
           if [ "$CURRENT_VERSION" = "none" ]; then
             COMMIT_MSG="🚀 添加 OpenList2 $LATEST_VERSION
 
@@ -408,8 +367,6 @@ jobs:
           fi
           
           git commit -m "$COMMIT_MSG"
-          
-          echo "🚀 推送到 ${{ env.TARGET_REPO }}..."
           git push origin ${{ env.BRANCH }}
           
           echo "✅ 部署完成"
