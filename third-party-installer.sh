@@ -182,29 +182,56 @@ check_scripts_update() {
     return 0
 }
 
-# 功能: 检测包文件类型
-# 参数: $1=文件名
-# 输出: 类型字符串
-detect_package_type() {
-    local filename="$1"
+# 功能: 智能匹配并筛选相关文件
+# 参数: $1=所有文件列表(换行分隔), $2=包名
+# 输出: 匹配的文件列表(换行分隔)
+filter_related_files() {
+    local all_files="$1"
+    local package_name="$2"
     
-    case "$filename" in
-        *.tar.gz|*.tgz)
-            if echo "$filename" | grep -qi "openwrt"; then
-                echo "tarball_ipk"
-            elif echo "$filename" | grep -qi "SNAPSHOT"; then
-                echo "tarball_apk"
-            else
-                echo "tarball_unknown"
+    local app_name="${package_name#luci-app-}"
+    app_name="${app_name#luci-theme-}"
+    
+    local matched_files=""
+    local old_IFS="$IFS"
+    IFS=$'\n'
+    
+    for filename in $all_files; do
+        [ -z "$filename" ] && continue
+        
+        local should_include=0
+        
+        # 1. 主程序文件 (精确匹配包名)
+        if echo "$filename" | grep -qiE "^${package_name}[_\.-]"; then
+            should_include=1
+            log "      [主程序] $filename"
+        
+        # 2. 语言包 (luci-i18n-xxx-zh-cn)
+        elif echo "$filename" | grep -qiE "^luci-i18n-${app_name}.*zh-cn"; then
+            should_include=1
+            log "      [语言包] $filename"
+        
+        # 3. 架构包 (包名去掉 luci-app- 或 luci-theme- 前缀)
+        elif echo "$filename" | grep -qiE "^${app_name}[_\.-]"; then
+            # 排除语言包误判
+            if ! echo "$filename" | grep -qi "i18n"; then
+                should_include=1
+                log "      [架构包] $filename"
             fi
-            ;;
-        *.ipk) echo "ipk" ;;
-        *.apk) echo "apk" ;;
-        *) echo "unknown" ;;
-    esac
+        fi
+        
+        if [ $should_include -eq 1 ]; then
+            matched_files="${matched_files}${filename}\n"
+        fi
+    done
+    
+    IFS="$old_IFS"
+    
+    # 去除末尾的 \n
+    echo -e "$matched_files" | grep -v "^$"
 }
 
-# 功能: 批量安装包文件
+# 功能: 批量安装包文件（按依赖顺序）
 # 参数: $1=包文件路径列表（换行分隔）
 # 返回: 0=全部成功, 1=有失败
 install_package_batch() {
@@ -216,17 +243,18 @@ install_package_batch() {
     local main_pkgs=""
     local lang_pkgs=""
     local all_pkgs=""
-    local other_pkgs=""
     
     local old_IFS="$IFS"
     IFS=$'\n'
     
+    # 分类文件
     for pkg_file in $pkg_files; do
         [ -z "$pkg_file" ] || [ ! -f "$pkg_file" ] && continue
         
         local filename=$(basename "$pkg_file")
         local size=$(stat -c%s "$pkg_file" 2>/dev/null || echo 0)
         
+        # 按文件名和大小分类
         if echo "$filename" | grep -qiE "luci-i18n.*zh-cn"; then
             lang_pkgs="${lang_pkgs}${pkg_file}\n"
         elif echo "$filename" | grep -qiE "^luci-(app|theme)-"; then
@@ -234,20 +262,22 @@ install_package_batch() {
         elif echo "$filename" | grep -qiE "[_-](all|noarch)\."; then
             all_pkgs="${all_pkgs}${pkg_file}\n"
         elif [ "$size" -gt 5242880 ]; then
+            # 大于 5MB 视为架构包（包含依赖）
             arch_pkgs="${arch_pkgs}${pkg_file}\n"
         else
-            other_pkgs="${other_pkgs}${pkg_file}\n"
+            # 其他架构包
+            arch_pkgs="${arch_pkgs}${pkg_file}\n"
         fi
     done
     
     IFS="$old_IFS"
     
+    # 定义安装批次（按依赖顺序）
     local batches="
 1|架构依赖包|$arch_pkgs
-2|其他依赖|$other_pkgs
-3|主程序|$main_pkgs
-4|语言包|$lang_pkgs
-5|通用包|$all_pkgs
+2|主程序|$main_pkgs
+3|语言包|$lang_pkgs
+4|通用包|$all_pkgs
 "
     
     local total_ok=0 total_fail=0 total_skip=0
@@ -266,6 +296,7 @@ install_package_batch() {
             
             local pkg_name=$(basename "$pkg_file" | sed 's/_.*\.\(ipk\|apk\)$//')
             
+            # 检查是否已安装
             if is_installed "$pkg_name"; then
                 log "    跳过已安装: $pkg_name"
                 total_skip=$((total_skip + 1))
@@ -291,41 +322,6 @@ install_package_batch() {
     [ $total_fail -eq 0 ] && return 0 || return 1
 }
 
-# 功能: 解压并安装tar.gz压缩包
-# 参数: $1=压缩包路径
-# 返回: 0=成功, 1=失败
-extract_and_install_tarball() {
-    local tarball="$1"
-    local temp_dir="/tmp/pkg_extract_$$"
-    
-    log "  [压缩包] 解压: $(basename "$tarball")"
-    
-    mkdir -p "$temp_dir"
-    
-    if ! tar -xzf "$tarball" -C "$temp_dir" 2>/dev/null; then
-        log "  解压失败"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    
-    local packages=$(find "$temp_dir" -type f \( -name "*.ipk" -o -name "*.apk" \) 2>/dev/null)
-    
-    if [ -z "$packages" ]; then
-        log "  未找到安装包"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    
-    local count=$(echo "$packages" | wc -l)
-    log "  找到 $count 个安装包"
-    
-    install_package_batch "$packages"
-    local ret=$?
-    
-    rm -rf "$temp_dir"
-    return $ret
-}
-
 # 功能: 安装或更新第三方包
 # 参数: $1=包名, $2=模式(install/update), $3=当前版本(仅update模式)
 # 返回: 0=成功, 2=已是最新, 1=失败
@@ -337,6 +333,7 @@ install_third_party_package() {
     log "[$([ "$mode" = "update" ] && echo "更新" || echo "安装")] $package_name"
     [ "$mode" = "update" ] && log "  当前版本: $current_version"
     
+    # 获取仓库元数据
     local metadata=$(get_repo_metadata)
     
     if [ -z "$metadata" ]; then
@@ -344,6 +341,7 @@ install_third_party_package() {
         return 1
     fi
     
+    # 检查包目录是否存在
     local package_dirs=""
     if which jsonfilter >/dev/null 2>&1; then
         package_dirs=$(echo "$metadata" | jsonfilter -e '@[@.type="dir"].name' 2>/dev/null)
@@ -358,6 +356,7 @@ install_third_party_package() {
     
     log "  包目录存在，查询版本..."
     
+    # 遍历所有源
     for source_config in $API_SOURCES; do
         local platform=$(echo "$source_config" | cut -d'|' -f1)
         local repo=$(echo "$source_config" | cut -d'|' -f2)
@@ -365,6 +364,7 @@ install_third_party_package() {
         
         log "  [源] $platform"
         
+        # 查询版本列表
         local versions_json=$(api_get_contents "$platform" "$repo" "$package_name" "$branch")
         
         if [ -z "$versions_json" ]; then
@@ -388,6 +388,7 @@ install_third_party_package() {
         local latest_version=$(echo "$versions" | head -1)
         log "    最新版本: $latest_version"
         
+        # 版本比对（仅更新模式）
         if [ "$mode" = "update" ]; then
             local cur_norm=$(normalize_version "$current_version")
             local new_norm=$(normalize_version "$latest_version")
@@ -398,6 +399,7 @@ install_third_party_package() {
             fi
         fi
         
+        # 查询文件列表
         local files_json=$(api_get_contents "$platform" "$repo" "$package_name/$latest_version" "$branch")
         
         if [ -z "$files_json" ]; then
@@ -405,80 +407,100 @@ install_third_party_package() {
             continue
         fi
         
+        # 提取所有 ipk/apk 文件
         local all_files=""
         if which jsonfilter >/dev/null 2>&1; then
-            all_files=$(echo "$files_json" | jsonfilter -e '@[@.type="file"].name' 2>/dev/null)
+            all_files=$(echo "$files_json" | jsonfilter -e '@[@.type="file"].name' 2>/dev/null | \
+                grep "${PKG_EXT}$")
         else
             all_files=$(extract_files_from_json "$files_json" "$PKG_EXT")
-            if [ -z "$all_files" ]; then
-                all_files=$(extract_files_from_json "$files_json" ".tar.gz")
-            fi
         fi
         
         if [ -z "$all_files" ]; then
-            log "    未找到可用文件"
+            log "    未找到 ${PKG_EXT} 文件"
             continue
         fi
         
-        log "    可用文件:"
+        log "    可用文件 (共 $(echo "$all_files" | wc -l) 个):"
         echo "$all_files" | while read f; do log "      $f"; done
         
-        local matched_file=$(find_best_match "$all_files" "$package_name")
+        # 智能筛选相关文件
+        log "    筛选相关文件:"
+        local matched_files=$(filter_related_files "$all_files" "$package_name")
         
-        if [ -z "$matched_file" ]; then
+        if [ -z "$matched_files" ]; then
             log "    未找到匹配文件"
             continue
         fi
         
-        local download_url=$(extract_download_url_from_json "$files_json" "$matched_file")
+        log "    匹配结果 (共 $(echo "$matched_files" | wc -l) 个):"
+        echo "$matched_files" | while read f; do log "      $f"; done
         
-        if [ -z "$download_url" ]; then
-            log "    无法获取下载链接"
+        # 下载所有匹配的文件
+        log "    开始下载..."
+        local temp_dir="/tmp/third_party_${package_name}_$$"
+        mkdir -p "$temp_dir"
+        
+        local download_failed=0
+        local downloaded_files=""
+        
+        local old_IFS="$IFS"
+        IFS=$'\n'
+        
+        for filename in $matched_files; do
+            [ -z "$filename" ] && continue
+            
+            local download_url=$(extract_download_url_from_json "$files_json" "$filename")
+            
+            if [ -z "$download_url" ]; then
+                log "      未找到下载链接: $filename"
+                download_failed=1
+                break
+            fi
+            
+            local temp_file="${temp_dir}/${filename}"
+            
+            log "      下载: $filename"
+            
+            if ! curl -fsSL -o "$temp_file" -H "User-Agent: Mozilla/5.0" "$download_url" 2>/dev/null; then
+                log "      下载失败"
+                download_failed=1
+                break
+            fi
+            
+            if ! validate_downloaded_file "$temp_file" 1024; then
+                log "      文件验证失败"
+                download_failed=1
+                break
+            fi
+            
+            downloaded_files="${downloaded_files}${temp_file}\n"
+        done
+        
+        IFS="$old_IFS"
+        
+        # 如果下载失败，清理并尝试下一个源
+        if [ $download_failed -eq 1 ]; then
+            rm -rf "$temp_dir"
+            log "    下载失败，尝试下一个源..."
             continue
         fi
         
-        log "    下载: $matched_file"
+        log "    所有文件下载完成"
         
-        local temp_file="/tmp/third_party_${matched_file}"
+        # 批量安装
+        log "    开始安装..."
         
-        if ! curl -fsSL -o "$temp_file" -H "User-Agent: Mozilla/5.0" "$download_url" 2>/dev/null; then
-            log "    下载失败"
-            rm -f "$temp_file"
-            continue
-        fi
-        
-        if ! validate_downloaded_file "$temp_file" 1024; then
-            log "    文件验证失败"
-            rm -f "$temp_file"
-            continue
-        fi
-        
-        local pkg_type=$(detect_package_type "$matched_file")
-        
-        log "    开始安装 (类型: $pkg_type)"
-        
-        case "$pkg_type" in
-            tarball_*)
-                extract_and_install_tarball "$temp_file"
-                ;;
-            ipk|apk)
-                install_package_batch "$temp_file"
-                ;;
-            *)
-                log "    未知文件类型"
-                rm -f "$temp_file"
-                continue
-                ;;
-        esac
-        
-        local ret=$?
-        rm -f "$temp_file"
-        
-        if [ $ret -eq 0 ]; then
+        if install_package_batch "$(echo -e "$downloaded_files")"; then
+            rm -rf "$temp_dir"
             log "  [成功] $package_name"
             log "    版本: $latest_version"
             log "    来源: $platform"
+            log "    文件数: $(echo "$matched_files" | wc -l) 个"
             return 0
+        else
+            rm -rf "$temp_dir"
+            log "    安装失败，尝试下一个源..."
         fi
     done
     
@@ -500,10 +522,10 @@ usage() {
 
 示例:
   # 首次安装
-  $0 install luci-app-passwall
+  $0 install luci-app-openclash
 
   # 检查更新
-  $0 update luci-app-passwall v1.2.3
+  $0 update luci-app-openclash v1.2.3
 
   # 检查脚本更新
   $0 --check-script-update
