@@ -1,38 +1,39 @@
 name: 同步仓库和镜像
 
 on:
-  workflow_dispatch:  # 手动触发
-  push:               # 工具文件改动触发
+  workflow_dispatch:
+  push:
     branches:
       - main
     paths:
       - 'auto-update.sh'
       - 'auto-setup'
       - 'third-party-installer.sh'
-  workflow_run:       # 主工作流完成触发
+  workflow_run:
     workflows: ["同步上游发布版本"]
     types:
       - completed
-  schedule:           # 定时同步
+  schedule:
     - cron: '30 19 * * *'
 
 env:
-  SOURCE_REPO: whzhni1/ipk_apk    # GitHub 源仓库
-  GITEE_USERNAME: whzhni          # Gitee 用户名
-  GITCODE_USERNAME: whzhni        # GitCode 用户名
+  SOURCE_REPO: whzhni1/ipk_apk
+  GITEE_USERNAME: whzhni
+  GITCODE_USERNAME: whzhni
   REPO: ipk_apk
   BRANCH: main
   FILES_TO_SYNC: 'auto-update.sh auto-setup third-party-installer.sh'
 
 jobs:
   # ========================================
-  # 阶段1: 同步文件到 GitHub（仅 push 触发）
+  # 阶段1: 同步文件到 GitHub
   # ========================================
   sync-files-to-github:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'  # 只在 push 时执行
+    if: github.event_name == 'push'
     outputs:
       files_changed: ${{ steps.sync.outputs.files_changed }}
+      changed_list: ${{ steps.sync.outputs.changed_list }}
     
     steps:
       - name: 检出本仓库
@@ -58,54 +59,121 @@ jobs:
       - name: 同步文件
         id: sync
         run: |
-          cd target
-          
           echo "========================================="
           echo "📋 同步文件到 ${{ env.SOURCE_REPO }}"
           echo "========================================="
+          echo ""
           
-          FILES_CHANGED=false
-          CHANGED_FILES=""
-          
+          # 显示源文件信息
+          echo "📁 源文件列表："
+          cd source
           for file in ${{ env.FILES_TO_SYNC }}; do
-            if [ -f "../source/$file" ]; then
-              cp "../source/$file" "./$file"
-              
-              if git diff --quiet "$file"; then
-                echo "⏭️  $file (无变化)"
-              else
-                echo "✅ $file (已更新)"
-                FILES_CHANGED=true
-                CHANGED_FILES="$CHANGED_FILES $file"
-              fi
+            if [ -f "$file" ]; then
+              size=$(ls -lh "$file" | awk '{print $5}')
+              md5=$(md5sum "$file" | awk '{print $1}')
+              echo "  ✅ $file ($size) [MD5: ${md5:0:8}...]"
             else
-              echo "⚠️  $file (源文件不存在)"
+              echo "  ❌ $file (不存在)"
             fi
           done
           
           echo ""
-          echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
+          echo "📁 目标文件列表（同步前）："
+          cd ../target
+          for file in ${{ env.FILES_TO_SYNC }}; do
+            if [ -f "$file" ]; then
+              size=$(ls -lh "$file" | awk '{print $5}')
+              md5=$(md5sum "$file" | awk '{print $1}')
+              echo "  📄 $file ($size) [MD5: ${md5:0:8}...]"
+            else
+              echo "  ⚠️  $file (不存在)"
+            fi
+          done
           
-          if [ "$FILES_CHANGED" = "true" ]; then
-            echo "📝 变更文件:$CHANGED_FILES"
+          echo ""
+          echo "🔄 开始复制文件..."
+          
+          # 复制文件
+          for file in ${{ env.FILES_TO_SYNC }}; do
+            if [ -f "../source/$file" ]; then
+              cp -f "../source/$file" "./$file"
+              echo "  ✅ 已复制: $file"
+            else
+              echo "  ❌ 跳过: $file (源文件不存在)"
+            fi
+          done
+          
+          echo ""
+          echo "🔍 检查变更..."
+          
+          # 检查是否有变更（包括新文件和修改的文件）
+          git add ${{ env.FILES_TO_SYNC }} 2>/dev/null || true
+          
+          # 使用 git diff --cached 检查暂存区的变化
+          if git diff --cached --quiet; then
+            echo "ℹ️  没有检测到文件变更"
+            echo "files_changed=false" >> $GITHUB_OUTPUT
+            echo "changed_list=" >> $GITHUB_OUTPUT
+          else
+            echo "✅ 检测到文件变更"
             
-            git add ${{ env.FILES_TO_SYNC }}
+            # 获取变更的文件列表
+            CHANGED_FILES=$(git diff --cached --name-only)
+            echo ""
+            echo "📝 变更文件："
+            echo "$CHANGED_FILES" | while read file; do
+              echo "  - $file"
+            done
             
+            # 显示详细差异
+            echo ""
+            echo "📊 文件差异："
+            git diff --cached --stat
+            
+            echo ""
+            echo "files_changed=true" >> $GITHUB_OUTPUT
+            echo "changed_list<<EOF" >> $GITHUB_OUTPUT
+            echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            
+            # 提交更改
             git commit -m "🔄 同步工具脚本更新
 
-            变更文件:$CHANGED_FILES
+            变更文件：
+            $CHANGED_FILES
 
-            - 来源: ${{ github.repository }}
-            - 提交: ${{ github.sha }}
-            - 时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
+            - 来源仓库: ${{ github.repository }}
+            - 提交 SHA: ${{ github.sha }}
+            - 提交信息: ${{ github.event.head_commit.message }}
+            - 更新时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
             
+            echo ""
             echo "🚀 推送到 ${{ env.SOURCE_REPO }}..."
-            git push
             
-            echo "✅ GitHub 同步完成"
-          else
-            echo "ℹ️  无文件变更，跳过推送"
+            # 推送并显示结果
+            if git push origin ${{ env.BRANCH }}; then
+              echo "✅ 推送成功"
+              
+              # 显示推送后的文件状态
+              echo ""
+              echo "📁 目标文件列表（同步后）："
+              for file in ${{ env.FILES_TO_SYNC }}; do
+                if [ -f "$file" ]; then
+                  size=$(ls -lh "$file" | awk '{print $5}')
+                  md5=$(md5sum "$file" | awk '{print $1}')
+                  echo "  ✅ $file ($size) [MD5: ${md5:0:8}...]"
+                fi
+              done
+            else
+              echo "❌ 推送失败"
+              exit 1
+            fi
           fi
+          
+          echo ""
+          echo "========================================="
+          echo "✅ GitHub 同步完成"
+          echo "========================================="
 
   # ========================================
   # 阶段2: 同步到 Gitee
@@ -128,10 +196,10 @@ jobs:
     
     steps:
       - name: 等待 GitHub 同步完成
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && needs.sync-files-to-github.outputs.files_changed == 'true'
         run: |
-          echo "⏳ 等待5秒确保 GitHub 同步完成..."
-          sleep 5
+          echo "⏳ 等待10秒确保 GitHub 同步完全生效..."
+          sleep 10
 
       - name: 检出源仓库
         uses: actions/checkout@v4
@@ -199,10 +267,10 @@ jobs:
     
     steps:
       - name: 等待 GitHub 同步完成
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && needs.sync-files-to-github.outputs.files_changed == 'true'
         run: |
-          echo "⏳ 等待5秒确保 GitHub 同步完成..."
-          sleep 5
+          echo "⏳ 等待10秒确保 GitHub 同步完全生效..."
+          sleep 10
 
       - name: 检出源仓库
         uses: actions/checkout@v4
@@ -260,9 +328,9 @@ jobs:
     steps:
       - name: 生成同步报告
         run: |
-          # 获取各阶段状态
           GITHUB_SYNC_STATUS="${{ needs.sync-files-to-github.result }}"
           FILES_CHANGED="${{ needs.sync-files-to-github.outputs.files_changed }}"
+          CHANGED_LIST="${{ needs.sync-files-to-github.outputs.changed_list }}"
           GITEE_STATUS="${{ needs.sync-to-gitee.result }}"
           GITCODE_STATUS="${{ needs.sync-to-gitcode.result }}"
           GITEE_CONFIGURED="${{ needs.sync-to-gitee.outputs.configured }}"
@@ -270,7 +338,6 @@ jobs:
           GITEE_DURATION="${{ needs.sync-to-gitee.outputs.duration }}"
           GITCODE_DURATION="${{ needs.sync-to-gitcode.outputs.duration }}"
           
-          # 设置默认值
           GITEE_DURATION=${GITEE_DURATION:-0}
           GITCODE_DURATION=${GITCODE_DURATION:-0}
           GITEE_CONFIGURED=${GITEE_CONFIGURED:-未设置}
@@ -368,33 +435,26 @@ jobs:
           
           ---
           
-          ### 📁 同步文件列表
+          ### 📁 同步文件
           
           EOF
           
-          # 显示同步的文件
           if [ "${{ github.event_name }}" == "push" ]; then
-            for file in ${{ env.FILES_TO_SYNC }}; do
-              echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
-            done
+            if [ "$FILES_CHANGED" == "true" ] && [ -n "$CHANGED_LIST" ]; then
+              echo "**变更文件：**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "$CHANGED_LIST" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            else
+              echo "**监控文件：**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              for file in ${{ env.FILES_TO_SYNC }}; do
+                echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
+              done
+            fi
           else
             echo "_本次触发不涉及文件同步_" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          # 添加配置提示
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "$GITEE_CONFIGURED" == "未设置" ] || [ "$GITCODE_CONFIGURED" == "未设置" ]; then
-            echo "### ⚙️ 配置提示" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            if [ "$GITEE_CONFIGURED" == "未设置" ]; then
-              echo "- **Gitee**: 需在仓库 Settings → Secrets 中添加 \`GITEE_TOKEN\`" >> $GITHUB_STEP_SUMMARY
-            fi
-            if [ "$GITCODE_CONFIGURED" == "未设置" ]; then
-              echo "- **GitCode**: 需在仓库 Settings → Secrets 中添加 \`GITCODE_TOKEN\`" >> $GITHUB_STEP_SUMMARY
-            fi
           fi
           
           # Annotation
