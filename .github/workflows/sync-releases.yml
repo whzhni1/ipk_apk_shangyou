@@ -1,9 +1,7 @@
-name: 同步上游发布版本
+name: 同步上游发布插件
 
 on:
-  schedule:
-    - cron: '0 19 * * *'  # 北京时间 3:00 AM = UTC 19:00
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:  # 只保留手动触发
 
 jobs:
   sync:
@@ -12,70 +10,62 @@ jobs:
     strategy:
       matrix:
         include:
-          # ===================================
-          # 上游仓库配置 - 在此添加或修改仓库
-          # ===================================
-          
-          # OpenClash（映射名称）
+          # OpenClash
           - github_owner: "vernesong"
             github_repo: "OpenClash"
             local_name: "luci-app-OpenClash"
             
-          # luci-app-tailscale（映射名称）
+          # luci-app-tailscale
           - github_owner: "whzhni1"
             github_repo: "luci-app-tailscale"
             local_name: "tailscale"
             
-          # luci-app-lucky（映射名称 + 过滤规则）
+          # luci-app-lucky
           - github_owner: "gdy666"
             github_repo: "luci-app-lucky"
             local_name: "lucky"
-            filter_include: "luci-app-*:1 luci-i18n-*:1 *wanji*"  # :1 表示只保留1个
+            filter_include: "luci-app-*:1 luci-i18n-*:1 *wanji*"
             
-          # luci-theme-aurora（保持原名）
+          # luci-theme-aurora
           - github_owner: "eamonxg"
             github_repo: "luci-theme-aurora"
             
-          # openwrt-passwall（映射名称 + 排除规则）
+          # openwrt-passwall
           - github_owner: "xiaorouji"
             github_repo: "openwrt-passwall"
             local_name: "luci-app-passwall"
             filter_exclude: "luci-19.07* *.zip"
             
-          # openwrt-passwall2（映射名称 + 排除规则）
+          # openwrt-passwall2
           - github_owner: "xiaorouji"
             github_repo: "openwrt-passwall2"
             local_name: "luci-app-passwall2"
             filter_exclude: "luci-19.07* *.zip"
-            
+
+
+          
           # 配置说明：
           # - github_owner: "作者名"                    # 必填
           # - github_repo: "项目名"                      # 必填  
-          # - local_name: "本地文件夹名"                # 可选，不设置则使用 github_repo
+          # - local_name: "目标仓库名"                # 可选，不设置则使用 github_repo
           # - filter_exclude: "*.zip *.rar"            # 可选，排除匹配的文件（空格分隔多个模式）
           # - filter_include: "*.ipk *zh-cn*"          # 可选，只保留匹配的文件
           # - filter_include: "luci-app-*:1"           # :1 表示该模式只保留第1个匹配的文件
-          
+            
       fail-fast: false
       max-parallel: 3
       
     steps:
-      - name: 检出目标仓库
-        uses: actions/checkout@v3
+      - name: 检出仓库
+        uses: actions/checkout@v4
         with:
-          repository: whzhni1/ipk_apk  # 目标仓库
-          fetch-depth: 0
-          token: ${{ secrets.PAT_TOKEN }}  # 使用 PAT Token
+          fetch-depth: 1
           
-      - name: 配置 Git
+      - name: 配置脚本权限
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-      - name: 安装依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl
+          chmod +x .github/workflows/scripts/release-GitCode.sh
+          chmod +x .github/workflows/scripts/release-gitee.sh
+          chmod +x .github/workflows/scripts/version-manager.sh
           
       - name: 设置本地名称
         id: set-names
@@ -87,9 +77,9 @@ jobs:
           
           echo "local_name=$local_name" >> $GITHUB_OUTPUT
           echo "📁 上游: ${{ matrix.github_repo }}"
-          echo "📂 本地: $local_name"
+          echo "📂 仓库: $local_name"
           
-      - name: 从 Tags 获取最新版本
+      - name: 获取上游最新版本
         id: get-version
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,34 +88,23 @@ jobs:
           github_repo="${{ matrix.github_repo }}"
           full_repo="${github_owner}/${github_repo}"
           
-          echo "========================================="
-          echo "📦 项目: $github_repo"
-          echo "👤 作者: $github_owner"
-          echo "========================================="
+          echo "📦 检查项目: $full_repo"
           
-          echo "📌 获取最新 Tag..."
+          # 获取最新 Tag
           tags_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/$full_repo/tags?per_page=1")
           
           if echo "$tags_response" | jq -e '.[0]' > /dev/null 2>&1; then
             latest_tag=$(echo "$tags_response" | jq -r '.[0].name')
-            echo "🆕 最新 Tag: $latest_tag"
+            echo "🔖 最新 Tag: $latest_tag"
           else
             echo "❌ 未找到 Tag"
             echo "has_release=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          if [ "$latest_tag" = "null" ] || [ -z "$latest_tag" ]; then
-            echo "❌ 无法获取 Tag"
-            echo "has_release=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          echo "📥 获取 Release..."
+          # 获取 Release
           release_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/$full_repo/releases/tags/$latest_tag")
           
           if echo "$release_response" | jq -e '.assets' > /dev/null 2>&1; then
@@ -133,15 +112,13 @@ jobs:
             echo "$release_response" > /tmp/release.json
             echo "has_release=true" >> $GITHUB_OUTPUT
           else
-            echo "⚠️  尝试最新 Release..."
+            # 尝试最新 Release
             latest_release=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/$full_repo/releases/latest")
             
             if echo "$latest_release" | jq -e '.assets' > /dev/null 2>&1; then
-              release_tag=$(echo "$latest_release" | jq -r '.tag_name')
-              echo "✅ 使用: $release_tag"
-              latest_tag="$release_tag"
+              latest_tag=$(echo "$latest_release" | jq -r '.tag_name')
+              echo "✅ 使用最新 Release: $latest_tag"
               echo "$latest_release" > /tmp/release.json
               echo "has_release=true" >> $GITHUB_OUTPUT
             else
@@ -151,73 +128,53 @@ jobs:
             fi
           fi
           
-          # 保存原始版本号
-          echo "raw_version=$latest_tag" >> $GITHUB_OUTPUT
-          
-          # 规范化版本号（确保有 v 前缀）
+          # 规范化版本号
           if [[ "$latest_tag" =~ ^v ]]; then
-            # 已经有 v 前缀
             normalized_version="$latest_tag"
-            echo "📌 版本格式: 已规范 ($normalized_version)"
           else
-            # 没有 v 前缀，添加
             normalized_version="v$latest_tag"
-            echo "📌 版本格式: 规范化 ($latest_tag → $normalized_version)"
           fi
           
           echo "version=$normalized_version" >> $GITHUB_OUTPUT
           
-      - name: 检查本地版本
-        id: check-local
+      - name: 检查是否需要更新
+        id: check-update
         if: steps.get-version.outputs.has_release == 'true'
         run: |
           local_name="${{ steps.set-names.outputs.local_name }}"
           latest_version="${{ steps.get-version.outputs.version }}"
           
-          echo "🔍 检查本地版本..."
+          # 读取本地版本记录
+          local_version=$(.github/workflows/scripts/version-manager.sh read "$local_name" 2>/dev/null || echo "")
           
-          if [ ! -d "$local_name" ]; then
-            echo "📁 创建目录: $local_name"
-            mkdir -p "$local_name"
+          if [ -z "$local_version" ]; then
+            echo "📝 本地版本: 无记录"
+            echo "✅ 需要发布（新项目）"
             echo "needs_update=true" >> $GITHUB_OUTPUT
-            echo "is_new=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # 检查是否存在该版本（使用规范化后的版本号）
-          if [ -d "$local_name/$latest_version" ]; then
-            echo "✅ 已存在: $latest_version"
+            echo "local_version=新建" >> $GITHUB_OUTPUT
+          elif [ "$local_version" != "$latest_version" ]; then
+            echo "📌 本地版本: $local_version"
+            echo "🆕 上游版本: $latest_version"
+            echo "✅ 需要更新"
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+            echo "local_version=$local_version" >> $GITHUB_OUTPUT
+          else
+            echo "📌 当前版本: $local_version"
+            echo "ℹ️  已是最新版本"
             echo "needs_update=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # 获取本地版本（应该都是 v 开头的）
-          local_versions=$(ls -1 "$local_name" 2>/dev/null | grep -v "^\." || true)
-          if [ -n "$local_versions" ]; then
-            local_version=$(echo "$local_versions" | head -n 1)
-            echo "📌 当前: $local_version"
             echo "local_version=$local_version" >> $GITHUB_OUTPUT
           fi
-          
-          echo "🔄 新版本: $latest_version"
-          echo "needs_update=true" >> $GITHUB_OUTPUT
 
-      - name: 下载文件
-        if: steps.check-local.outputs.needs_update == 'true'
+      - name: 下载文件到临时目录
+        if: steps.check-update.outputs.needs_update == 'true'
         run: |
-          local_name="${{ steps.set-names.outputs.local_name }}"
           latest_version="${{ steps.get-version.outputs.version }}"
-          local_version="${{ steps.check-local.outputs.local_version }}"
-          is_new="${{ steps.check-local.outputs.is_new }}"
           
-          if [ -n "$local_version" ] && [ "$is_new" != "true" ]; then
-            echo "🗑️  删除旧版本"
-            rm -rf "$local_name"/*
-          fi
+          # 使用 runner 临时目录
+          DOWNLOAD_DIR="${{ runner.temp }}/downloads"
+          mkdir -p "$DOWNLOAD_DIR"
           
-          target_dir="$local_name/$latest_version"
-          mkdir -p "$target_dir"
-          echo "📂 创建: $target_dir"
+          echo "📂 下载目录: $DOWNLOAD_DIR"
           
           latest_release=$(cat /tmp/release.json)
           download_count=$(echo "$latest_release" | jq '.assets | length')
@@ -228,101 +185,82 @@ jobs:
             exit 0
           fi
           
-          echo "📥 下载 $download_count 个文件"
+          echo "📥 开始下载 $download_count 个文件"
+          
+          downloaded=0
+          failed=0
           
           echo "$latest_release" | jq -r '.assets[] | "\(.browser_download_url)|\(.name)"' | while IFS='|' read -r url filename; do
             if [ -n "$url" ] && [ -n "$filename" ]; then
-              if curl -L -f --max-time 300 -o "$target_dir/$filename" "$url" 2>/dev/null; then
-                size=$(ls -lh "$target_dir/$filename" | awk '{print $5}')
-                echo "✅ $filename ($size)"
+              if curl -L -f --max-time 300 -o "$DOWNLOAD_DIR/$filename" "$url" 2>/dev/null; then
+                size=$(ls -lh "$DOWNLOAD_DIR/$filename" | awk '{print $5}')
+                echo "  ✅ $filename ($size)"
+                downloaded=$((downloaded + 1))
               else
-                echo "❌ $filename"
+                echo "  ❌ $filename"
+                failed=$((failed + 1))
               fi
             fi
           done
           
-          file_count=$(find "$target_dir" -type f 2>/dev/null | wc -l)
+          file_count=$(find "$DOWNLOAD_DIR" -type f 2>/dev/null | wc -l)
           
           echo ""
-          echo "📊 完成: $file_count 个文件"
+          echo "📊 下载完成: $file_count 个文件"
           
           if [ "$file_count" -eq 0 ]; then
             echo "❌ 下载失败"
-            rm -rf "$target_dir"
-            [ -z "$(ls -A "$local_name" 2>/dev/null)" ] && rm -rf "$local_name"
             echo "downloaded=false" >> $GITHUB_ENV
             exit 1
           fi
           
           echo "downloaded=true" >> $GITHUB_ENV
+          echo "DOWNLOAD_DIR=$DOWNLOAD_DIR" >> $GITHUB_ENV
           
       - name: 应用过滤规则
         if: env.downloaded == 'true' && (matrix.filter_exclude != '' || matrix.filter_include != '')
         run: |
-          local_name="${{ steps.set-names.outputs.local_name }}"
           latest_version="${{ steps.get-version.outputs.version }}"
-          raw_version="${{ steps.get-version.outputs.raw_version }}"
           filter_exclude="${{ matrix.filter_exclude }}"
           filter_include="${{ matrix.filter_include }}"
           
-          WORK_DIR="$(pwd)"
-          TARGET_DIR="$WORK_DIR/$local_name/$latest_version"
-          TEMP_DIR="$WORK_DIR/$local_name/.filter_temp"
+          DOWNLOAD_DIR="${{ env.DOWNLOAD_DIR }}"
+          TEMP_DIR="${{ runner.temp }}/filtered"
           
-          # 获取不带 v 的版本号（用于文件名匹配）
           VERSION_NO_V=${latest_version#v}
           
-          echo "========================================="
           echo "🧹 应用过滤规则"
-          echo "========================================="
-          echo "规范化版本: $latest_version"
-          echo "匹配版本: $VERSION_NO_V (用于文件名匹配)"
-          
-          # 显示规则
+          echo "匹配版本: $VERSION_NO_V"
           [ -n "$filter_exclude" ] && echo "排除: $filter_exclude"
           [ -n "$filter_include" ] && echo "保留: $filter_include"
-          echo ""
           
           rm -rf "$TEMP_DIR"
           mkdir -p "$TEMP_DIR"
           
-          # 如果有 include 规则，使用白名单模式
+          # 白名单模式
           if [ -n "$filter_include" ]; then
-            echo "📋 白名单模式（只保留匹配项）"
-            
-            # 解析 include 规则，支持 :1 限制数量
             declare -A pattern_count
             declare -A pattern_limit
             
             for pattern_rule in $filter_include; do
-              # 检查是否有数量限制（如 luci-app-*:1）
               if [[ "$pattern_rule" == *:* ]]; then
                 pattern="${pattern_rule%:*}"
                 limit="${pattern_rule#*:}"
-                
-                # 替换版本号变量
                 pattern="${pattern//\{VERSION\}/$VERSION_NO_V}"
-                
                 pattern_limit["$pattern"]=$limit
                 pattern_count["$pattern"]=0
               else
                 pattern="$pattern_rule"
-                
-                # 替换版本号变量
                 pattern="${pattern//\{VERSION\}/$VERSION_NO_V}"
-                
                 pattern_limit["$pattern"]=999999
                 pattern_count["$pattern"]=0
               fi
             done
             
-            # 遍历文件
-            for file in "$TARGET_DIR"/*; do
+            for file in "$DOWNLOAD_DIR"/*; do
               [ -f "$file" ] || continue
               filename=$(basename "$file")
               
-              # 检查是否匹配任何 include 模式
-              matched=false
               for pattern in "${!pattern_limit[@]}"; do
                 if [[ "$filename" == $pattern ]]; then
                   current_count=${pattern_count["$pattern"]}
@@ -331,22 +269,18 @@ jobs:
                   if [ $current_count -lt $limit ]; then
                     cp "$file" "$TEMP_DIR/"
                     pattern_count["$pattern"]=$((current_count + 1))
-                    matched=true
                     break
                   fi
                 fi
               done
             done
             
-          # 如果只有 exclude 规则，使用黑名单模式
+          # 黑名单模式
           elif [ -n "$filter_exclude" ]; then
-            echo "📋 黑名单模式（排除匹配项）"
-            
-            for file in "$TARGET_DIR"/*; do
+            for file in "$DOWNLOAD_DIR"/*; do
               [ -f "$file" ] || continue
               filename=$(basename "$file")
               
-              # 检查是否匹配任何 exclude 模式
               excluded=false
               for pattern in $filter_exclude; do
                 if [[ "$filename" == $pattern ]]; then
@@ -355,119 +289,160 @@ jobs:
                 fi
               done
               
-              # 不匹配排除规则的文件保留
               if [ "$excluded" = false ]; then
                 cp "$file" "$TEMP_DIR/"
               fi
             done
           fi
           
-          # 统计结果
           file_count=$(ls -1 "$TEMP_DIR" 2>/dev/null | wc -l)
-          
-          echo "📊 过滤结果: $file_count 个文件"
+          echo "📊 过滤后: $file_count 个文件"
           
           if [ "$file_count" -eq 0 ]; then
             echo "⚠️  过滤后无文件"
-            rm -rf "$TEMP_DIR" "$TARGET_DIR"
-            [ -z "$(ls -A "$WORK_DIR/$local_name" 2>/dev/null)" ] && rm -rf "$WORK_DIR/$local_name"
             echo "downloaded=false" >> $GITHUB_ENV
           else
-            rm -rf "$TARGET_DIR"
-            mv "$TEMP_DIR" "$TARGET_DIR"
+            rm -rf "$DOWNLOAD_DIR"
+            mv "$TEMP_DIR" "$DOWNLOAD_DIR"
             echo "✅ 过滤完成"
           fi
-          
-      - name: 提交并推送到目标仓库
+
+      - name: 🚀 并行发布到 GitCode 和 Gitee
         if: env.downloaded == 'true'
+        env:
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          GITCODE_USERNAME: ${{ secrets.GITCODE_USERNAME || 'whzhni' }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME || 'whzhni' }}
         run: |
+          local_name="${{ steps.set-names.outputs.local_name }}"
+          version="${{ steps.get-version.outputs.version }}"
           github_owner="${{ matrix.github_owner }}"
           github_repo="${{ matrix.github_repo }}"
+          
+          BUILD_TIME=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')
+          
+          RELEASE_BODY="## 📦 ${local_name} ${version}
+
+          ### 📌 项目信息
+          - 项目名称: ${github_repo}
+          - 项目版本: ${version}
+          - 上游仓库: https://github.com/${github_owner}/${github_repo}
+          - 上游地址: https://github.com/${github_owner}/${github_repo}/releases/tag/${version#v}
+
+          ### 🔨 同步信息
+          - 同步时间: ${BUILD_TIME} (北京时间)
+          - 工作流运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          UPLOAD_FILES=$(find "${{ env.DOWNLOAD_DIR }}" -type f | tr '\n' ' ')
+          
+          echo "准备并行发布"
+          echo "仓库名: $local_name"
+          echo "版本: $version"
+          echo "文件数: $(echo $UPLOAD_FILES | wc -w)"
+          
+          # 并行发布
+          (
+            GITCODE_TOKEN="$GITCODE_TOKEN" \
+            USERNAME="$GITCODE_USERNAME" \
+            REPO_NAME="$local_name" \
+            TAG_NAME="$version" \
+            RELEASE_TITLE="$local_name $version" \
+            RELEASE_BODY="$RELEASE_BODY" \
+            UPLOAD_FILES="$UPLOAD_FILES" \
+            RUNNER_TEMP="${{ runner.temp }}" \
+            .github/workflows/scripts/release-GitCode.sh
+          ) &
+          GITCODE_PID=$!
+          
+          (
+            GITEE_TOKEN="$GITEE_TOKEN" \
+            USERNAME="$GITEE_USERNAME" \
+            REPO_NAME="$local_name" \
+            TAG_NAME="$version" \
+            RELEASE_TITLE="$local_name $version" \
+            RELEASE_BODY="$RELEASE_BODY" \
+            UPLOAD_FILES="$UPLOAD_FILES" \
+            RUNNER_TEMP="${{ runner.temp }}" \
+            .github/workflows/scripts/release-gitee.sh
+          ) &
+          GITEE_PID=$!
+          
+          wait $GITCODE_PID
+          GITCODE_STATUS=$?
+          
+          wait $GITEE_PID
+          GITEE_STATUS=$?
+          
+          echo ""
+          echo "📊 发布结果"
+          echo "GitCode: $([ $GITCODE_STATUS -eq 0 ] && echo '✅ 成功' || echo '❌ 失败')"
+          echo "Gitee:   $([ $GITEE_STATUS -eq 0 ] && echo '✅ 成功' || echo '❌ 失败')"
+          
+          if [ $GITCODE_STATUS -eq 0 ] || [ $GITEE_STATUS -eq 0 ]; then
+            echo "release_success=true" >> $GITHUB_ENV
+          else
+            echo "::error::两个平台都发布失败"
+            exit 1
+          fi
+
+      - name: 更新版本记录
+        if: env.release_success == 'true'
+        run: |
           local_name="${{ steps.set-names.outputs.local_name }}"
-          latest_version="${{ steps.get-version.outputs.version }}"
+          version="${{ steps.get-version.outputs.version }}"
           
-          git add "$local_name"
+          .github/workflows/scripts/version-manager.sh write "$local_name" "$version"
           
-          if git diff --staged --quiet; then
-            echo "ℹ️  无需提交"
-            exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add version.txt
+          
+          if ! git diff --staged --quiet; then
+            git commit -m "📝 更新版本: $local_name → $version"
+            git pull --rebase origin ${{ github.ref_name }} || true
+            git push origin ${{ github.ref_name }}
+            echo "✅ 版本记录已更新"
+          else
+            echo "ℹ️  版本记录无变化"
           fi
           
-          git commit -m "🚀 更新 $github_repo 到版本 $latest_version
-          
-          - 上游项目: $github_repo
-          - 本地目录: $local_name
-          - 版本号: $latest_version
-          - 上游仓库: $github_owner/$github_repo
-          - 更新时间: $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)"
-          
-          max_retries=5
-          retry_count=0
-          
-          while [ $retry_count -lt $max_retries ]; do
-            if git push; then
-              echo "✅ 推送成功到 whzhni1/ipk_apk"
-              break
-            else
-              retry_count=$((retry_count + 1))
-              if [ $retry_count -lt $max_retries ]; then
-                echo "⚠️  重试 $retry_count/$max_retries"
-                sleep $((retry_count * 5))
-                git pull --rebase --autostash
-              else
-                echo "❌ 推送失败"
-                exit 1
-              fi
-            fi
-          done
-  
-      - name: 输出结果
+      - name: 生成状态信息
         if: always()
         run: |
           github_repo="${{ matrix.github_repo }}"
           local_name="${{ steps.set-names.outputs.local_name }}"
-          latest_version="${{ steps.get-version.outputs.version }}"
-          local_version="${{ steps.check-local.outputs.local_version }}"
+          version="${{ steps.get-version.outputs.version }}"
+          local_version="${{ steps.check-update.outputs.local_version }}"
           
-          # 创建状态文件
           mkdir -p /tmp/status
           
-          # 确定状态
           if [ "${{ steps.get-version.outputs.has_release }}" != "true" ]; then
-            status="未找到"
+            status="未找到 Release"
             upstream_ver="-"
             local_ver="-"
-          elif [ "${{ steps.check-local.outputs.needs_update }}" != "true" ]; then
-            status="无需更新"
-            upstream_ver="${latest_version}"
-            local_ver="${latest_version}"
-          elif [ "${{ env.downloaded }}" == "true" ]; then
-            status="✅ 已更新"
-            upstream_ver="${latest_version}"
-            local_ver="${local_version:-新建}"
+          elif [ "${{ steps.check-update.outputs.needs_update }}" != "true" ]; then
+            status="✅ 无需更新"
+            upstream_ver="${version}"
+            local_ver="${version}"
+          elif [ "${{ env.release_success }}" == "true" ]; then
+            status="✅ 已发布"
+            upstream_ver="${version}"
+            local_ver="${local_version}"
           else
             status="❌ 失败"
-            upstream_ver="${latest_version:-"-"}"
+            upstream_ver="${version:-"-"}"
             local_ver="${local_version:-"-"}"
           fi
           
-          # 写入状态文件（逐行写入，避免 heredoc 问题）
           echo "${github_repo}" > "/tmp/status/${github_repo}.txt"
           echo "${local_name}" >> "/tmp/status/${github_repo}.txt"
           echo "${upstream_ver}" >> "/tmp/status/${github_repo}.txt"
           echo "${local_ver}" >> "/tmp/status/${github_repo}.txt"
           echo "${status}" >> "/tmp/status/${github_repo}.txt"
           
-          echo ""
-          echo "========================================="
-          echo "📋 $github_repo: $status"
-          [ "$local_name" != "$github_repo" ] && echo "   → $local_name"
-          echo "   上游版本: $upstream_ver"
-          echo "   本地版本: $local_ver"
-          echo "   目标仓库: whzhni1/ipk_apk"
-          echo "========================================="
-          
-      - name: 上传状态信息
+      - name: 上传状态
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -480,8 +455,9 @@ jobs:
     needs: sync
     runs-on: ubuntu-latest
     if: always()
+    
     steps:
-      - name: 下载所有状态信息
+      - name: 下载状态信息
         uses: actions/download-artifact@v4
         with:
           pattern: status-*
@@ -490,31 +466,21 @@ jobs:
           
       - name: 生成报告
         run: |
-          echo "# 📋 同步报告" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**目标仓库:** whzhni1/ipk_apk" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**执行时间:** $(TZ='Asia/Shanghai' date +'%Y年%m月%d日 %H:%M:%S') (北京时间)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 📋 上游同步报告
           
-          if [ "${{ needs.sync.result }}" == "success" ]; then
-            echo "**状态:** ✅ 所有任务完成" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.sync.result }}" == "failure" ]; then
-            echo "**状态:** ⚠️ 部分任务失败" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "**状态:** ℹ️ 任务执行完毕" >> $GITHUB_STEP_SUMMARY
-          fi
+          **执行时间:** $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S') (北京时间)
           
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## 📊 同步详情" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 项目名称 | 本地目录 | 上游版本 | 本地版本 | 更新情况 |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|----------|----------|----------|----------|" >> $GITHUB_STEP_SUMMARY
+          ## 📊 同步详情
           
-          total_count=0
-          updated_count=0
-          skipped_count=0
-          failed_count=0
+          | 上游项目 | 仓库名称 | 上游版本 | 本地版本 | 状态 |
+          |----------|----------|----------|----------|------|
+          EOF
+          
+          total=0
+          updated=0
+          skipped=0
+          failed=0
           
           for artifact_dir in /tmp/artifacts/status-*/; do
             if [ -d "$artifact_dir" ]; then
@@ -526,11 +492,11 @@ jobs:
                   local_ver=$(sed -n '4p' "$status_file" | tr -d '\r')
                   status=$(sed -n '5p' "$status_file" | tr -d '\r')
                   
-                  total_count=$((total_count + 1))
+                  total=$((total + 1))
                   case "$status" in
-                    *"已更新"*) updated_count=$((updated_count + 1)) ;;
-                    *"无需更新"*) skipped_count=$((skipped_count + 1)) ;;
-                    *"失败"*) failed_count=$((failed_count + 1)) ;;
+                    *"已发布"*) updated=$((updated + 1)) ;;
+                    *"无需更新"*) skipped=$((skipped + 1)) ;;
+                    *"失败"*) failed=$((failed + 1)) ;;
                   esac
                   
                   echo "| $github_repo | $local_name | $upstream_ver | $local_ver | $status |" >> $GITHUB_STEP_SUMMARY
@@ -539,12 +505,18 @@ jobs:
             fi
           done
           
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**统计:** 总计 $total_count 个项目，已更新 $updated_count 个，无需更新 $skipped_count 个，失败 $failed_count 个" >> $GITHUB_STEP_SUMMARY
+          cat >> $GITHUB_STEP_SUMMARY << EOF
           
-      - name: 清理临时 Artifacts
+          ---
+          
+          **统计:** 总计 $total 个项目 | 已发布 $updated 个 | 无需更新 $skipped 个 | 失败 $failed 个
+          
+          **发布平台:**
+          - 🌐 GitCode
+          - 🌐 Gitee
+          EOF
+          
+      - name: 清理临时文件
         if: always()
         uses: geekyeggo/delete-artifact@v5
         with:
